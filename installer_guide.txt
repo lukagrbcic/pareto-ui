@@ -1,0 +1,236 @@
+PARETO UI INSTALLATION GUIDE (LINUX / UBUNTU 24.04)
+====================================================
+
+This guide records the setup used successfully on Ubuntu 24.04 x86_64.
+It uses pyenv rather than Conda and runs PARETO UI in a web browser.
+
+
+1. PREREQUISITES
+----------------
+
+Required:
+
+  - Git
+  - pyenv
+  - pyenv-virtualenv
+  - Python 3.11.9 installed through pyenv
+
+Check the installation:
+
+  git --version
+  pyenv --version
+  pyenv virtualenv --version
+  pyenv versions
+
+If Python 3.11.9 is not listed, install it:
+
+  pyenv install 3.11.9
+
+
+2. CREATE THE PYTHON ENVIRONMENT
+--------------------------------
+
+Run these commands from the pareto-ui repository root:
+
+  pyenv virtualenv 3.11.9 pareto-ui
+  pyenv local pareto-ui
+
+The second command creates an ignored .python-version file and makes pyenv
+select the pareto-ui environment whenever this directory is entered.
+
+Verify it:
+
+  python --version
+  pyenv version
+
+Expected Python version:
+
+  Python 3.11.9
+
+
+3. INSTALL NODE.JS IN THE PYENV ENVIRONMENT
+--------------------------------------------
+
+The project expects Node.js 18. Node is installed inside the pareto-ui pyenv,
+so a system-wide Node installation is not required.
+
+  python -m pip install --upgrade pip nodeenv
+  nodeenv -p --node=18.20.8 --prebuilt
+  pyenv rehash
+
+Verify it:
+
+  node --version
+  npm --version
+
+Expected versions from this setup:
+
+  Node.js v18.20.8
+  npm 10.8.2
+
+If node or npm is not found immediately after nodeenv completes, run:
+
+  pyenv rehash
+
+Then enter the repository again or start a new terminal.
+
+
+4. INSTALL THE PYTHON DEPENDENCIES
+-----------------------------------
+
+From the repository root:
+
+  python -m pip install -r backend/requirements.txt
+
+This installs the FastAPI backend, IDAES, Pyomo, Gurobi's Python package, and
+the tested Project PARETO revision pinned in backend/requirements.txt.
+
+The default UI workflow uses CBC. A Gurobi license is only needed if Gurobi is
+selected as the optimization solver.
+
+
+5. INSTALL THE ELECTRON AND REACT DEPENDENCIES
+-----------------------------------------------
+
+From the repository root:
+
+  npm --prefix electron clean-install
+  npm --prefix electron/ui clean-install
+
+These commands use the checked-in package-lock.json files. Do not run
+"npm audit fix --force" just to remove audit warnings, because it can install
+breaking dependency versions and modify the lockfiles.
+
+
+6. CREATE THE FRONTEND ENVIRONMENT FILE
+----------------------------------------
+
+Create electron/ui/.env with this content:
+
+  REACT_APP_PARETO_VERSION=main
+  REACT_APP_BUILD_NUMBER=local
+
+One way to create it from the repository root is:
+
+  printf '%s\n' \
+    'REACT_APP_PARETO_VERSION=main' \
+    'REACT_APP_BUILD_NUMBER=local' \
+    > electron/ui/.env
+
+This file is ignored by Git.
+
+
+7. INSTALL IDAES/CBC SOLVER EXTENSIONS
+---------------------------------------
+
+IDAES 2.5 does not recognize Ubuntu 24.04 by name. Use its compatible Ubuntu
+22.04 x86_64 binary bundle explicitly:
+
+  idaes get-extensions --distro ubuntu2204 --verbose
+
+The binaries are installed under:
+
+  ~/.idaes/bin
+
+Verify CBC directly:
+
+  ~/.idaes/bin/cbc -stop
+
+The successful setup reported CBC 2.10.10.
+
+
+8. RUN PARETO UI IN A BROWSER (RECOMMENDED)
+--------------------------------------------
+
+From the repository root:
+
+  npm --prefix electron/ui run app-start
+
+This starts both services:
+
+  React UI:     http://127.0.0.1:3000
+  FastAPI:      http://127.0.0.1:50011
+  FastAPI docs: http://127.0.0.1:50011/docs
+
+The browser should open automatically. If it does not, open
+http://127.0.0.1:3000 manually.
+
+Stop both development servers with Ctrl+C in the terminal where they are
+running.
+
+
+9. OPTIONAL: RUN THE ELECTRON DESKTOP WINDOW
+---------------------------------------------
+
+Instead of browser mode, run:
+
+  npm --prefix electron/ui run electron-start
+
+Do not run browser mode and Electron mode at the same time because both try to
+use ports 3000 and 50011.
+
+
+10. VERIFY THE INSTALLATION
+---------------------------
+
+With the application running, these commands should return HTTP status 200:
+
+  curl --silent --output /dev/null --write-out '%{http_code}\n' \
+    http://127.0.0.1:3000/
+
+  curl --silent --output /dev/null --write-out '%{http_code}\n' \
+    http://127.0.0.1:50011/openapi.json
+
+Run the CBC precision regression tests from the repository root:
+
+  PYTHONPATH=backend python -m unittest discover \
+    -s backend/tests \
+    -p 'test_solver_precision.py'
+
+The successful setup passed all three tests.
+
+
+11. REINSTALLATION
+------------------
+
+To rebuild only the JavaScript dependencies, keep the Python environment and
+run:
+
+  npm --prefix electron clean-install
+  npm --prefix electron/ui clean-install
+
+To completely recreate the Python and Node environment:
+
+  pyenv uninstall pareto-ui
+  pyenv virtualenv 3.11.9 pareto-ui
+  pyenv local pareto-ui
+  python -m pip install --upgrade pip nodeenv
+  nodeenv -p --node=18.20.8 --prebuilt
+  pyenv rehash
+  python -m pip install -r backend/requirements.txt
+  npm --prefix electron clean-install
+  npm --prefix electron/ui clean-install
+  idaes get-extensions --distro ubuntu2204 --verbose
+
+Recreate electron/ui/.env as described in step 6 if it is missing.
+
+
+12. LOCAL DATA AND TROUBLESHOOTING
+----------------------------------
+
+PARETO UI stores local scenario data under:
+
+  ~/.pareto
+
+Do not delete that directory during a reinstall unless the saved local
+scenarios and outputs should also be erased.
+
+Development startup currently prints some existing Pyomo deprecation, ESLint,
+Browserslist, and npm audit warnings. These warnings did not prevent the
+backend or frontend from starting successfully.
+
+If port 3000 or 50011 is already in use, stop the previous PARETO UI process
+before launching it again.
+
+The repository also contains environment.yml for a Conda-based installation,
+but that path was not used for the setup documented here.
