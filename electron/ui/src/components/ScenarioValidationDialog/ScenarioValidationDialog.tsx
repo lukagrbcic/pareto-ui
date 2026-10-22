@@ -13,10 +13,10 @@ const STATES: Record<string, string> = {
 };
 
 export default function ScenarioValidationDialog({open, loading, advancing = false, error, result,
-  onAdvance, onCheckFeasibility, onSelectIssue, onSelectTable, onClose}: {
+  onAdvance, onCheckFeasibility, onSelectIssue, onSelectTable, onAskAI, onClose}: {
   open: boolean; loading: boolean; advancing?: boolean; error?: string | null; result?: ScenarioValidation | null;
   onAdvance?: () => void; onCheckFeasibility?: () => void; onSelectIssue?: (issue: ValidationIssue) => void;
-  onSelectTable?: (table: string) => void; onClose: () => void;
+  onSelectTable?: (table: string) => void; onAskAI?: (result: ScenarioValidation) => void; onClose: () => void;
 }) {
   const issues = result?.issues || [];
   return <Dialog open={open} onClose={loading ? undefined : onClose} fullWidth maxWidth="md">
@@ -37,6 +37,7 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
       </>}
     </DialogContent>
     <DialogActions>
+      {!loading && result && onAskAI && (issues.length > 0 || result.state === 'infeasible') && <Button onClick={() => onAskAI(result)} variant="outlined">Fix with AI</Button>}
       {!loading && result?.valid && onCheckFeasibility && result.feasibility !== 'feasible' && <Button onClick={onCheckFeasibility} variant="outlined">Check feasibility</Button>}
       {!loading && !error && result?.valid && result.state !== 'outdated' && <Button onClick={onAdvance} disabled={advancing} variant="contained">Advance to Optimization Setup</Button>}
       <Button onClick={onClose} disabled={loading}>Close</Button>

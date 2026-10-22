@@ -542,8 +542,11 @@ async def request_ai_data_update(request: Request, id: int) -> dict:
     """
     req = await request.json()
     prompt = req.get("prompt", None)
+    validation_findings = req.get("validation_findings", None)
+    if validation_findings is not None and not isinstance(validation_findings, (list, dict)):
+        raise HTTPException(400, detail="validation_findings must be a list or object.")
     if prompt:
-        updatedScenario = scenario_handler.generate_data_with_ai(id, prompt)
+        updatedScenario = scenario_handler.generate_data_with_ai(id, prompt, validation_findings)
     else:
         raise HTTPException(400, detail=f"Please provide a prompt.")
     return updatedScenario

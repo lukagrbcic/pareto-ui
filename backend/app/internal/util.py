@@ -405,8 +405,10 @@ def build_map_data_from_json(data_input):
 
     return map_data
 
-def FormatPrompt(user_prompt, data = None):
-    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON with the updated JSON scenario object. Along with the updated scenario, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. Please also provide a detailed 'updateNotes', so that I can explain to the user what was updated.\n"
+def FormatPrompt(user_prompt, data = None, optimization_settings = None, validation_findings = None):
+    from app.internal.ai.docs import prompt_reference_docs
+
+    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON. Along with the updated data, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. If essential information is missing (for example a node, table, or period the request depends on does not exist in the scenario, or an engineering value cannot be inferred from the provided data), do not guess or invent values: include a top-level key called 'questions' with a list of short questions, and return 'updatedScenario' only for the parts you can fill from the provided data; if you cannot make any changes, omit 'updatedScenario' and return only the questions. Please also provide 'updateNotes' as an array of short plain-text strings for the user to review. Format rules: one note per distinct change or finding; each note is a single sentence of at most 240 characters; no markdown, no line breaks inside a note, no numbered essays. The first note should summarize what you interpreted the request to mean, then add one note per changed table stating what changed and why. Do not bundle several changes into one long note. Anything that needs the user's decision belongs in 'questions', not in updateNotes.\n"
 
     if data:
         prompt_data = f"Here is the scenario: {data}\n\n"
@@ -418,11 +420,20 @@ def FormatPrompt(user_prompt, data = None):
     # If we can define these rules, it should improve how well this works.
     dataset_rules = "" # f"Some rules about the dataset:\n"
 
-    prompt = f"{user_disclosure}{dataset_rules}{prompt_data}Here is the prompt:\n{user_prompt}"
+    reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
+    reference = f"{reference_docs}\n\n" if reference_docs else ""
+
+    validation = ""
+    if validation_findings:
+        validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
+
+    prompt = f"{user_disclosure}{reference}{dataset_rules}{validation}{prompt_data}Here is the prompt:\n{user_prompt}"
 
     return prompt
 
-def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_context = None):
+def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_context = None, optimization_settings = None):
+    from app.internal.ai.docs import diagnosis_reference_docs
+
     user_disclosure = (
         "You are diagnosing a failed PARETO optimization run inside a desktop application. "
         "The optimization model comes from the project-pareto Python package and uses the pyomo Python package underneath. "
@@ -448,7 +459,9 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
 
     scenario_data = f"Scenario context:\n{scenario}\n\n" if scenario else ""
     diagnosis_data = f"Diagnosis context:\n{diagnosis_context}\n\n" if diagnosis_context else ""
-    return f"{user_disclosure}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
+    reference_docs = diagnosis_reference_docs(optimization_settings, error_message)
+    reference = f"{reference_docs}\n\n" if reference_docs else ""
+    return f"{user_disclosure}{reference}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
 
 def summarize_long_text(text, start_chars=6000, end_chars=4000):
     if text is None:

@@ -50,6 +50,7 @@ export default function Bottombar(props) {
     const [ showModalError, setShowModalError ] = useState(false)
     const [ modalError, setModalError ] = useState('')
     const [ openAIPrompt, setOpenAIPrompt ] = useState(false)
+    const [ aiValidationFindings, setAiValidationFindings ] = useState<ScenarioValidation | null>(null)
     const [ key, setKey ] =  useState(null)
     const [ hasOverride, setHasOverride ] = useState(false)
     const [ openValidationDialog, setOpenValidationDialog ] = useState(false)
@@ -61,13 +62,23 @@ export default function Bottombar(props) {
     useEffect(() => {
       setValidationResult(null); setValidationLoading(false); setValidationAdvancing(false); setValidationError(null);
       setOpenValidationDialog(false);
+      setAiValidationFindings(null);
       return () => { validationVersion.current += 1; };
     }, [id, scenario?.input_revision, props.saving, inputDataEdited]);
     const handleOpenSaveModal = () => setOpenSaveModal(true);
     const handleCloseSaveModal = () => setOpenSaveModal(false);
     const handleCloseRerunModal = () => setOpenRerunModal(false);
     const handleOpenAIPrompt = () => setOpenAIPrompt(true);
-    const handleCloseAIPrompt = () => setOpenAIPrompt(false);
+    const handleCloseAIPrompt = () => { setOpenAIPrompt(false); setAiValidationFindings(null); };
+    const handleFixValidationWithAI = (result: ScenarioValidation) => {
+      setOpenValidationDialog(false);
+      setAiValidationFindings(result);
+      setOpenAIPrompt(true);
+    };
+    const handleAIUpdatesApplied = () => {
+      handleCloseAIPrompt();
+      handleValidateScenario();
+    };
     const handleCloseValidationDialog = () => setOpenValidationDialog(false);
 
 
@@ -349,6 +360,8 @@ export default function Bottombar(props) {
         onClose={handleCloseAIPrompt}
         scenarioId={id}
         scenarioName={name}
+        validationFindings={aiValidationFindings}
+        onApplied={handleAIUpdatesApplied}
       />}
       <ScenarioValidationDialog
         open={openValidationDialog}
@@ -360,6 +373,7 @@ export default function Bottombar(props) {
         onSelectTable={handleSelectValidationTable}
         onCheckFeasibility={() => handleValidateScenario(true)}
         onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
+        onAskAI={handleFixValidationWithAI}
         onClose={handleCloseValidationDialog}
       />
     </Box>

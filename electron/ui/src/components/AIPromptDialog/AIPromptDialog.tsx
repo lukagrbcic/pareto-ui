@@ -1,5 +1,6 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
+  Alert,
   Box,
   Button,
   Chip,
@@ -23,23 +24,106 @@ interface AIPromptDialogProps {
   onClose: () => void;
   scenarioId: string | number | null | undefined;
   scenarioName?: string;
+  validationFindings?: unknown;
+  onApplied?: () => void;
+}
+
+const DIFF_PREVIEW_ROWS = 6;
+
+interface DiffTableData {
+  key: string;
+  columns: string[];
+  rows: Array<{ index: number; cells: any[]; changed: boolean[] }>;
+  totalChangedRows: number;
+}
+
+function DiffTable({ table, expanded, onToggle }: { table: DiffTableData; expanded: boolean; onToggle: () => void }): JSX.Element {
+  const visibleRows = expanded ? table.rows : table.rows.slice(0, DIFF_PREVIEW_ROWS);
+  const hasMore = table.rows.length > DIFF_PREVIEW_ROWS;
+  const headerCell = { fontWeight: 600, color: "text.secondary", minWidth: 0, overflowWrap: "anywhere" } as const;
+  return (
+    <Box sx={{ px: 2, py: 1.5, overflowX: "auto" }}>
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: `minmax(36px, 48px) repeat(${table.columns.length}, minmax(120px, 1fr))`,
+          gap: 1.5,
+          fontSize: "0.75rem",
+          minWidth: `${(table.columns.length + 1) * 120}px`,
+        }}
+      >
+        <Box sx={headerCell}>#</Box>
+        {table.columns.map((col) => (
+          <Box key={col} sx={headerCell}>
+            {col}
+          </Box>
+        ))}
+        {visibleRows.map((row) => (
+          <React.Fragment key={`${table.key}-${row.index}`}>
+            <Box sx={{ color: "text.secondary", minWidth: 0, overflowWrap: "anywhere" }}>{row.index + 1}</Box>
+            {row.cells.map((cell, idx) => (
+              <Box
+                key={`${table.key}-${row.index}-${idx}`}
+                sx={{
+                  px: 0.5,
+                  py: 0.25,
+                  borderRadius: 1,
+                  minWidth: 0,
+                  overflowWrap: "anywhere",
+                  border: row.changed[idx]
+                    ? "1px solid rgba(1, 103, 143, 0.55)"
+                    : "1px solid rgba(0, 0, 0, 0.08)",
+                  bgcolor: row.changed[idx] ? "rgba(1, 103, 143, 0.22)" : "transparent",
+                  color: row.changed[idx] ? "text.primary" : "text.secondary",
+                  fontWeight: row.changed[idx] ? 600 : 400,
+                  opacity: row.changed[idx] ? 1 : 0.55,
+                }}
+              >
+                {cell}
+              </Box>
+            ))}
+          </React.Fragment>
+        ))}
+      </Box>
+      <Box sx={{ mt: 1, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+        <Typography variant="caption" color="text.secondary">
+          {table.totalChangedRows === 0
+            ? "No row-level changes detected."
+            : !hasMore || expanded
+              ? `Showing all ${table.totalChangedRows} changed rows.`
+              : `Showing ${DIFF_PREVIEW_ROWS} of ${table.totalChangedRows} changed rows.`}
+        </Typography>
+        {hasMore && (
+          <Button size="small" variant="text" onClick={onToggle}>
+            {expanded ? "Show fewer" : `Show all ${table.totalChangedRows} rows`}
+          </Button>
+        )}
+      </Box>
+    </Box>
+  );
 }
 
 export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element {
-  const { open, onClose, scenarioId, scenarioName } = props;
+  const { open, onClose, scenarioId, scenarioName, validationFindings, onApplied } = props;
   const { status: requestStatus, isRunning, updatedScenario: requestUpdates, updateNotes: requestNotes,
-    errorMessage: requestError, requestKind, requestScenarioId, runPrompt, clearResult } = useAIPrompt();
+    questions: requestQuestions, errorMessage: requestError, requestKind, requestScenarioId, runPrompt, clearResult } = useAIPrompt();
   const { scenarioData, handleScenarioUpdate } = useScenario();
   const matchesScenario = requestKind === 'data-update' && scenarioId != null &&
     requestScenarioId === Number(scenarioId) && requestScenarioId === scenarioData?.id;
   const status = matchesScenario ? requestStatus : 'idle';
   const updatedScenario = matchesScenario ? requestUpdates : null;
   const updateNotes = useMemo(() => matchesScenario ? requestNotes : [], [matchesScenario, requestNotes]);
+  const questions = useMemo(() => matchesScenario ? requestQuestions : [], [matchesScenario, requestQuestions]);
   const errorMessage = matchesScenario ? requestError : null;
   const [prompt, setPrompt] = useState("");
   const [promptError, setPromptError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"notes" | "diff">("notes");
+  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
   const aiDataInput = updatedScenario;
+
+  useEffect(() => {
+    setExpandedTables(new Set());
+  }, [updatedScenario]);
 
   const statusLabel = useMemo(() => {
     if (status === "running") return "Running";
@@ -55,10 +139,14 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       return;
     }
     setPromptError(null);
-    await runPrompt(scenarioId, trimmed);
+    await runPrompt(scenarioId, trimmed, validationFindings);
   };
 
-  const handleSaveUpdates = (): void => {
+  const handleQuestionClick = (question: string): void => {
+    setPrompt((current) => (current.trim() ? `${current.trim()}\n${question}` : question));
+  };
+
+  const handleSaveUpdates = async (): Promise<void> => {
     if (!scenarioData || !updatedScenario) return;
     const mergedScenario = {
       ...scenarioData,
@@ -67,7 +155,20 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
         ...aiDataInput,
       },
     };
-    handleScenarioUpdate(mergedScenario, false, "json");
+    const saved = await handleScenarioUpdate(mergedScenario, false, "json");
+    if (saved) onApplied?.();
+  };
+
+  const toggleTableExpanded = (key: string): void => {
+    setExpandedTables((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
   };
 
   const handleClearPrompt = (): void => {
@@ -88,7 +189,16 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       note
         .replace(/df_parameters\[['"]([^'"]+)['"]\]/g, "$1")
         .replace(/df_parameters\./g, "");
-    return updateNotes.map(stripPrefix);
+    const bullets: string[] = [];
+    updateNotes.forEach((note) => {
+      stripPrefix(note)
+        .split(/\n+/)
+        .forEach((line) => {
+          const cleaned = line.trim().replace(/^[-*•]\s+/, "").trim();
+          if (cleaned) bullets.push(cleaned);
+        });
+    });
+    return bullets;
   }, [updateNotes]);
   const diffTables = useMemo(() => {
     if (!scenarioData || !aiDataInput) return [];
@@ -100,7 +210,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       columns: string[];
       rows: Array<{ index: number; cells: any[]; changed: boolean[] }>;
       totalChangedRows: number;
-      hasMoreRows: boolean;
       nonTabular: boolean;
     }> = [];
 
@@ -131,7 +240,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
           columns: [],
           rows: [],
           totalChangedRows: 0,
-          hasMoreRows: false,
           nonTabular: true,
         });
         return;
@@ -171,17 +279,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
         }
       }
 
-      const previewRows = changedRows.slice(0, 6);
       tableDiffs.push({
         key: tableKey,
-        columns: columnKeys.slice(0, 6),
-        rows: previewRows.map((row) => ({
-          ...row,
-          cells: row.cells.slice(0, 6),
-          changed: row.changed.slice(0, 6),
-        })),
+        columns: columnKeys,
+        rows: changedRows,
         totalChangedRows: changedRows.length,
-        hasMoreRows: changedRows.length > previewRows.length,
         nonTabular: false,
       });
     });
@@ -194,7 +296,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       open={open}
       onClose={handleClose}
       fullWidth
-      maxWidth="sm"
+      maxWidth="md"
       PaperProps={{
         sx: {
           borderRadius: 3,
@@ -223,6 +325,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
         </Stack>
       </DialogTitle>
       <DialogContent sx={{ pt: 1 }}>
+        {validationFindings != null && (
+          <Alert severity="info" sx={{ mb: 1 }}>
+            The current validation findings will be shared with the AI so it can target them.
+          </Alert>
+        )}
         <TextField
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
@@ -247,6 +354,26 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
           <Typography variant="body2" color="error" sx={{ mt: 2 }}>
             {errorMessage}
           </Typography>
+        )}
+        {questions.length > 0 && (
+          <Box sx={{ mt: 2, p: 2, borderRadius: 2, bgcolor: "rgba(237, 108, 2, 0.08)", border: "1px solid rgba(237, 108, 2, 0.35)" }}>
+            <Typography variant="subtitle2" sx={{ mb: 1 }}>
+              The assistant needs more information before it can proceed. Click a question to answer it:
+            </Typography>
+            <Stack spacing={0.5}>
+              {questions.map((question) => (
+                <Button
+                  key={question}
+                  onClick={() => handleQuestionClick(question)}
+                  variant="text"
+                  color="inherit"
+                  sx={{ justifyContent: "flex-start", textTransform: "none", px: 1, py: 0.25, textAlign: "left" }}
+                >
+                  {question}
+                </Button>
+              ))}
+            </Stack>
+          </Box>
         )}
         {showSuccessPanel && (
           <Box sx={{ mt: 3, p: 2, borderRadius: 2, bgcolor: "rgba(1, 103, 143, 0.08)" }}>
@@ -299,56 +426,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
                         </Typography>
                       </Box>
                     ) : (
-                      <Box sx={{ px: 2, py: 1.5, overflowX: "auto" }}>
-                        <Box
-                          sx={{
-                            display: "grid",
-                            gridTemplateColumns: `minmax(36px, 48px) repeat(${table.columns.length}, minmax(120px, 1fr))`,
-                            gap: 1.5,
-                            fontSize: "0.75rem",
-                            minWidth: `${(table.columns.length + 1) * 120}px`,
-                          }}
-                        >
-                          <Box sx={{ fontWeight: 600, color: "text.secondary" }}>#</Box>
-                          {table.columns.map((col) => (
-                            <Box key={col} sx={{ fontWeight: 600, color: "text.secondary" }}>
-                              {col}
-                            </Box>
-                          ))}
-                          {table.rows.map((row) => (
-                            <React.Fragment key={`${table.key}-${row.index}`}>
-                              <Box sx={{ color: "text.secondary" }}>{row.index + 1}</Box>
-                              {row.cells.map((cell, idx) => (
-                                <Box
-                                  key={`${table.key}-${row.index}-${idx}`}
-                                  sx={{
-                                    px: 0.5,
-                                    py: 0.25,
-                                    borderRadius: 1,
-                                    border: row.changed[idx]
-                                      ? "1px solid rgba(1, 103, 143, 0.55)"
-                                      : "1px solid rgba(0, 0, 0, 0.08)",
-                                    bgcolor: row.changed[idx] ? "rgba(1, 103, 143, 0.22)" : "transparent",
-                                    color: row.changed[idx] ? "text.primary" : "text.secondary",
-                                    fontWeight: row.changed[idx] ? 600 : 400,
-                                    opacity: row.changed[idx] ? 1 : 0.55,
-                                  }}
-                                >
-                                  {cell}
-                                </Box>
-                              ))}
-                            </React.Fragment>
-                          ))}
-                        </Box>
-                        <Box sx={{ mt: 1 }}>
-                          <Typography variant="caption" color="text.secondary">
-                            {table.totalChangedRows === 0
-                              ? "No row-level changes detected."
-                              : `Showing ${table.rows.length} of ${table.totalChangedRows} changed rows.`}
-                            {table.hasMoreRows ? " Refine your prompt or review full data after saving." : ""}
-                          </Typography>
-                        </Box>
-                      </Box>
+                      <DiffTable table={table} expanded={expandedTables.has(table.key)} onToggle={() => toggleTableExpanded(table.key)} />
                     )}
                   </Box>
                 ))}

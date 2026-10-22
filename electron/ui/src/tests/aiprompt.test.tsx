@@ -185,3 +185,50 @@ test('malformed diagnosis never reports success and an explicit retry can recove
   expect(context.status).toBe('success');
   expect(context.diagnosis).toEqual(diagnosis);
 });
+
+test('validation findings are sent with the fill request when provided', async () => {
+  render(<View />);
+  await waitFor(() => expect(context.isAvailable).toBe(true));
+  const findings = [{ code: 'missing_value', table: 'PadRates', severity: 'error' }];
+  act(() => {
+    void context.runPrompt(0, 'Fix the findings', findings);
+  });
+  expect(requests).toHaveLength(1);
+  const updateCall = (global.fetch as jest.Mock).mock.calls.find((call) =>
+    String(call[0]).includes('request_ai_data_update'));
+  const body = JSON.parse(updateCall[1].body);
+  expect(body.prompt).toBe('Fix the findings');
+  expect(body.validation_findings).toEqual(findings);
+  await act(async () => requests[0].resolve(response(filled)));
+  expect(context.status).toBe('success');
+});
+
+test('multi-line update notes render as one scannable bullet per line', async () => {
+  render(<View dialog />);
+  await waitFor(() => expect(context.isAvailable).toBe(true));
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
+  await act(async () => requests[0].resolve(response({
+    status: 'success',
+    updatedScenario: { df_parameters: { PadRates: { T01: [0] } } },
+    updateNotes: ['Interpreted the request as filling missing set data.\n- df_sets: added ProductionPads [PP01]\n- df_sets: added StorageSites [S02]'],
+  })));
+  expect(screen.getByText('Interpreted the request as filling missing set data.')).toBeVisible();
+  expect(screen.getByText('df_sets: added ProductionPads [PP01]')).toBeVisible();
+  expect(screen.getByText('df_sets: added StorageSites [S02]')).toBeVisible();
+});
+
+test('questions without a patch are surfaced for a follow-up instead of a save preview', async () => {
+  render(<View dialog />);
+  await waitFor(() => expect(context.isAvailable).toBe(true));
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill demand' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
+  await act(async () => requests[0].resolve(response({
+    status: 'success', updateNotes: [], questions: ['Which unit should demand use?'],
+  })));
+  expect(context.questions).toEqual(['Which unit should demand use?']);
+  expect(context.status).toBe('success');
+  expect(screen.queryByRole('button', { name: 'Save Updates' })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Which unit should demand use?' }));
+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toContain('Which unit should demand use?');
+});

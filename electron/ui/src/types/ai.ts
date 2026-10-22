@@ -14,6 +14,7 @@ export interface AIPromptResponse {
   status: "success" | "error";
   updatedScenario?: AIPromptUpdatedScenario;
   updateNotes?: string[];
+  questions?: string[];
   errorMessage?: string;
   error?: string;
 }

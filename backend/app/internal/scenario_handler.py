@@ -769,7 +769,7 @@ class ScenarioHandler:
 
     
     @time_it
-    def generate_data_with_ai(self, id, user_prompt):
+    def generate_data_with_ai(self, id, user_prompt, validation_findings=None):
         _log.info(f"generate_data_with_ai user prompt: {user_prompt}")
         try:
 
@@ -785,7 +785,7 @@ class ScenarioHandler:
                 "detail": "AI client is not configured. Provide an API key to enable AI features."
             }
         if data_input:
-            prompt = FormatPrompt(user_prompt=user_prompt, data=data_input)
+            prompt = FormatPrompt(user_prompt=user_prompt, data=data_input, optimization_settings=scenario.get("optimization"), validation_findings=validation_findings)
             # _log.info(f"full prompt: {prompt}")
             _log.info(f"hitting cborg now")
             resp = cborg.prompt(prompt)
@@ -807,6 +807,25 @@ class ScenarioHandler:
                 return answer
             
             updatedScenario = answer.get("updatedScenario")
+            notes = answer.get("updateNotes")
+            if isinstance(notes, str):
+                answer["updateNotes"] = [notes] if notes.strip() else []
+            elif isinstance(notes, list):
+                if all(isinstance(n, str) and n.strip() for n in notes):
+                    answer["updateNotes"] = [n for n in notes if n.strip()]
+                else:
+                    _log.info(f"dropping malformed AI updateNotes: {notes!r}")
+                    answer.pop("updateNotes", None)
+            elif notes is not None:
+                _log.info(f"dropping malformed AI updateNotes: {notes!r}")
+                answer.pop("updateNotes", None)
+            questions = answer.get("questions")
+            if questions is not None:
+                if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
+                    answer["questions"] = [q.strip() for q in questions]
+                else:
+                    _log.info(f"dropping malformed AI questions: {questions!r}")
+                    answer.pop("questions", None)
             return answer
         else:
             return {
@@ -877,6 +896,7 @@ class ScenarioHandler:
         prompt = FormatOptimizationDiagnosisPrompt(
             error_message=truncated_failure_message,
             diagnosis_context=json.dumps(diagnosis_context, default=str),
+            optimization_settings=scenario.get("optimization"),
         )
         _log.info("hitting cborg for optimization diagnosis")
 

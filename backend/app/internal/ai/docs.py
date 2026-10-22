@@ -1,0 +1,282 @@
+"""PARETO reference documentation for AI prompt grounding.
+
+Grounding comes from the prebuilt SQLite FTS5 index built by
+backend/scripts/build_docs_index.py. The index file is expected at
+app/internal/ai/pareto_docs_index.sqlite or the path given by
+PARETO_DOCS_INDEX. The prompt builders retrieve only the chunks relevant to
+the request (user prompt or failure message) plus a small always-on
+terminology block.
+
+Without the index the helpers return empty strings, so AI features keep
+working ungrounded rather than failing. The rst/markdown parsing helpers
+below are used by the build script to (re)generate the index from the
+pareto_docs snapshot; they are not consulted at request time.
+"""
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+_DOCS_SUBPATHS = {
+    "strategic": Path("model_library") / "strategic_water_management" / "index.rst",
+    "hydraulics": Path("model_library") / "Hydraulics" / "index.rst",
+    "water_treatment": Path("model_library") / "water_treatment" / "index.rst",
+    "operational": Path("model_library") / "operational_water_management" / "index.rst",
+    "ui": Path("user_interface") / "how_to_use_ui.rst",
+    "faq": Path("faq.rst"),
+    "tutorials": Path("tutorials_examples") / "index.rst",
+    "getting_started": Path("getting_started") / "index.rst",
+    "get_data": Path("utilities") / "Get_Data.rst",
+}
+
+# App-owned documentation that lives in this repository rather than in the
+# pareto_docs snapshot; resolved relative to the repo root.
+_APP_DOCS_SUBPATHS = {
+    "parameter_requirements": Path("docs") / "ui-parameter-requirements.md",
+}
+
+
+def _clean_rst(text):
+    text = re.sub(r"^\.\. _.*:\s*$", "", text, flags=re.M)
+    text = re.sub(r":math:`([^`]*)`", r"\1", text)
+    text = re.sub(r":ref:`([^`]*)`", r"\1", text)
+    text = re.sub(r"^\s*[+|][+\-=|:\s]*[+|]\s*$", "", text, flags=re.M)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _parse_sections(text):
+    """Split an rst document into (title, body) sections via underline headings."""
+    lines = text.split("\n")
+    sections = []
+    title, buffer = "", []
+    for index, line in enumerate(lines):
+        underline = lines[index + 1].strip() if index + 1 < len(lines) else ""
+        is_heading = (
+            line.strip()
+            and not line.startswith((" ", "\t", "+", "|"))
+            and len(underline) >= 3
+            and set(underline) <= {"=", "-"}
+            and len(underline) >= len(line.strip())
+        )
+        if is_heading:
+            if buffer:
+                sections.append((title, "\n".join(buffer).strip()))
+            title, buffer = line.strip(), []
+        else:
+            buffer.append(line)
+    if buffer:
+        sections.append((title, "\n".join(buffer).strip()))
+    return sections
+
+
+_MD_HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def _parse_markdown(text):
+    """Split a markdown document into (title, body) sections via # headings."""
+    sections = []
+    title, buffer = None, []
+    for line in text.split("\n"):
+        match = _MD_HEADING.match(line)
+        if match:
+            if title is not None:
+                sections.append((title, "\n".join(buffer).strip()))
+            title, buffer = match.group(2).strip(), []
+        else:
+            buffer.append(line)
+    if title is not None:
+        sections.append((title, "\n".join(buffer).strip()))
+    return sections
+
+
+def _load(path):
+    try:
+        return _parse_sections(_clean_rst(path.read_text(encoding="utf-8")))
+    except OSError:
+        return []
+
+
+def _load_markdown(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return _parse_markdown(re.sub(r"\n{3,}", "\n\n", text))
+
+
+def load_sections(root):
+    """Parse the reference documents under a docs root into {name: [(title, body), ...]}.
+
+    Used by the index build script (backend/scripts/build_docs_index.py) to
+    generate the FTS5 index from the pareto_docs snapshot; not consulted at
+    request time.
+    """
+    base = Path(root)
+    sections = {name: _load(base / subpath) for name, subpath in _DOCS_SUBPATHS.items()}
+    repo_root = Path(__file__).resolve().parents[4]
+    for name, subpath in _APP_DOCS_SUBPATHS.items():
+        sections[name] = _load_markdown(repo_root / subpath)
+    return sections
+
+
+def _render(header, blocks):
+    rendered = []
+    for title, text in blocks:
+        if text:
+            rendered.append(f"--- {title} ---\n{text}")
+    if not rendered:
+        return ""
+    body = "\n\n".join(rendered)
+    return f"{header}:\n\n{body}" if header else body
+
+
+# ---------------------------------------------------------------------------
+# FTS5 index retrieval
+# ---------------------------------------------------------------------------
+
+_INDEX_FILENAME = "pareto_docs_index.sqlite"
+
+# Character budgets for retrieved content per request type; terminology is on
+# top of these. Chunks are ~4000-6000 chars each, so these allow roughly 4-6
+# (autofill) and 6-8 (diagnosis) chunks.
+_AUTOFILL_RETRIEVAL_BUDGET = 22000
+_DIAGNOSIS_RETRIEVAL_BUDGET = 32000
+
+_STOPWORDS = {
+    "the", "and", "for", "with", "are", "was", "were", "not", "can", "has",
+    "have", "had", "this", "that", "then", "than", "from", "into", "onto",
+    "when", "what", "how", "why", "who", "its", "you", "your", "their",
+    "there", "here", "all", "any", "but", "out", "per", "via", "she", "him",
+    "her", "his", "our", "ours", "will", "would", "could", "should", "may",
+    "might", "must", "shall", "does", "did", "done", "being", "been", "have",
+}
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_CAMEL_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _index_path():
+    configured = os.environ.get("PARETO_DOCS_INDEX")
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parent / _INDEX_FILENAME
+
+
+_index_connections = {}
+
+
+def _index_connection():
+    """Open (once) a read-only connection to the FTS5 index; None if unavailable."""
+    path = _index_path()
+    if not path.is_file():
+        return None
+    key = str(path)
+    if key not in _index_connections:
+        try:
+            # check_same_thread=False: connections may be created and used on
+            # different FastAPI worker threads; read-only access is safe.
+            connection = sqlite3.connect(f"file:{key}?mode=ro", uri=True, check_same_thread=False)
+            connection.execute("SELECT 1 FROM chunks LIMIT 1")
+        except (sqlite3.Error, OSError):
+            return None
+        _index_connections[key] = connection
+    return _index_connections[key]
+
+
+def query_tokens(text, limit=40):
+    """Reduce free text to a bounded list of lowercase FTS terms.
+
+    Splits camelCase identifiers (TruckingHourlyCost -> trucking hourly cost)
+    and drops stopwords so error messages and prose queries work as OR searches.
+    """
+    tokens = []
+    for word in _WORD_RE.findall(text or ""):
+        for part in (_CAMEL_RE.findall(word) or [word]):
+            part = part.lower()
+            if len(part) >= 2 and part not in _STOPWORDS and part not in tokens:
+                tokens.append(part)
+    return tokens[:limit]
+
+
+def _retrieve(query, budget_chars, max_chunks, exclude=()):
+    """Return [(doc, title, body)] chunks ranked by bm25 within a char budget."""
+    connection = _index_connection()
+    if connection is None:
+        return []
+    tokens = query_tokens(query)
+    if not tokens:
+        return []
+    match = " OR ".join(f'"{token}"' for token in tokens)
+    try:
+        rows = connection.execute(
+            "SELECT doc, title, body FROM chunks WHERE chunks MATCH ? "
+            "ORDER BY bm25(chunks) LIMIT ?",
+            (match, max_chunks * 3),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    excluded = {(doc, title.split(" (part ")[0]) for doc, title in exclude}
+    selected, used = [], 0
+    for doc, title, body in rows:
+        key = (doc, title.split(" (part ")[0])
+        if key in excluded or not body:
+            continue
+        if used + len(body) > budget_chars:
+            continue
+        selected.append((doc, title, body))
+        used += len(body)
+        if len(selected) >= max_chunks:
+            break
+    return selected
+
+
+def _terminology_block():
+    """The small strategic-model terminology section, from the FTS5 index."""
+    connection = _index_connection()
+    if connection is None:
+        return ""
+    try:
+        row = connection.execute(
+            "SELECT body FROM chunks WHERE doc = 'strategic' AND title = 'Terminology' LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return row[0] if row else ""
+
+
+def prompt_reference_docs(optimization_settings=None, query=None):
+    """Reference docs for AI input filling: always-on terminology plus the
+    chunks the user's prompt makes relevant. Empty string without the index.
+    """
+    if _index_connection() is None:
+        return ""
+    blocks = []
+    terminology = _terminology_block()
+    if terminology:
+        blocks.append(("Terminology", terminology))
+    retrieved = _retrieve(
+        query, _AUTOFILL_RETRIEVAL_BUDGET, max_chunks=8,
+        exclude={("strategic", "Terminology")},
+    )
+    blocks.extend((f"[{doc}] {title}", body) for doc, title, body in retrieved)
+    return _render("Reference documentation for the PARETO strategic model", blocks)
+
+
+def diagnosis_reference_docs(optimization_settings=None, query=None):
+    """Reference docs for optimization diagnosis: always-on terminology plus
+    chunks retrieved against the failure message. Empty string without the
+    index.
+    """
+    if _index_connection() is None:
+        return ""
+    blocks = []
+    terminology = _terminology_block()
+    if terminology:
+        blocks.append(("Terminology", terminology))
+    retrieved = _retrieve(
+        query, _DIAGNOSIS_RETRIEVAL_BUDGET, max_chunks=12,
+        exclude={("strategic", "Terminology")},
+    )
+    blocks.extend((f"[{doc}] {title}", body) for doc, title, body in retrieved)
+    return _render("Reference documentation for the PARETO strategic model", blocks)

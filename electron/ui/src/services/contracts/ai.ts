@@ -113,14 +113,20 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
   if (error) return error;
   const result = object({
     status: literal('success'),
-    updatedScenario: unknown,
+    updatedScenario: optional(unknown),
     updateNotes: optional(array(string)),
     updatedNotes: optional(array(string)),
+    questions: optional(array(string)),
   })(value, path);
+  if (result.updatedScenario === undefined && result.questions === undefined)
+    throw new DecodeError(path, 'an AI response with updates or questions');
   return {
     status: 'success',
-    updatedScenario: updatedInputs(result.updatedScenario, `${path}.updatedScenario`),
+    updatedScenario: result.updatedScenario !== undefined
+      ? updatedInputs(result.updatedScenario, `${path}.updatedScenario`)
+      : undefined,
     updateNotes: result.updateNotes ?? result.updatedNotes,
+    questions: result.questions,
   };
 };
 

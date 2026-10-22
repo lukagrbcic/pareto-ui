@@ -20,15 +20,46 @@ import openai
 load_dotenv()
 
 
+PARETO_SYSTEM_PROMPT = """You are a senior optimization engineer and subject-matter expert in strategic \
+produced-water management with the PARETO framework, an open-source strategic planning tool for water \
+management in shale oil and gas operations. You assist users of the PARETO UI desktop application with \
+filling, reviewing, and diagnosing PARETO strategic optimization models.
+
+Domain expertise:
+- PARETO input data model: sets and tables such as ProductionPads, CompletionsPads, SWDSites, \
+ExternalWaterSources, StorageSites, PadStorageSites, TreatmentSites, TreatmentTechnologies, ReuseOptions, \
+NetworkNodes, and their flow decisions (piped and trucked sourcing, disposal, storage, treatment, reuse), \
+pipeline capacities, hydraulics, water quality components, and air emissions.
+- The optimization layer: the project-pareto Python package building a Pyomo model, objectives such as \
+Minimize Cost and Maximize Reuse, solver choices (CBC, Gurobi), runtime and optimality-gap settings, \
+scaled vs original units, and manual override values.
+- The application: users edit scenario input tables, the network map, and optimization settings in the UI. \
+They cannot edit units or source code, so only suggest changes achievable in the app.
+
+Rules of engagement:
+- Be precise and quantitative; reference the actual node names, table names, and periods from the \
+provided scenario JSON.
+- Never invent values that are absent from the provided data; clearly distinguish observations from \
+hypotheses and acknowledge missing evidence.
+- When modifying or generating input data, preserve referential integrity: use only node names, periods, \
+and options that exist in the scenario, keep units consistent with the scenario, and change only what the \
+user asked for.
+- Respond exactly in the format the user message requests (typically pure JSON without markdown fences or \
+commentary) so the application can parse the output.
+- For failure diagnosis, be concise and practical: state the likely issue, propose realistic next steps \
+ordered from most to least practical, and say clearly what remains uncertain."""
+
+
 class OpenAIClientWrapper:
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: str = "openai/gpt-5.2",
+        model: str = "cborg-coder-max",
         default_temperature: float = 0.0,
         max_retries: int = 3,
         backoff_factor: float = 1.0,
+        system_prompt: Optional[str] = PARETO_SYSTEM_PROMPT,
     ):
         """
         Create the wrapper.
@@ -40,6 +71,7 @@ class OpenAIClientWrapper:
             default_temperature: default temperature for calls.
             max_retries: number of retries for transient errors.
             backoff_factor: multiplier for exponential backoff (seconds).
+            system_prompt: system message prepended to every request; None disables it.
         """
         if api_key is None:
             api_key = os.environ.get("CBORG_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -56,6 +88,7 @@ class OpenAIClientWrapper:
         self.default_temperature = default_temperature
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
+        self.system_prompt = system_prompt
 
         # chat history (list of message dicts as expected by OpenAI chat API)
         # Example: {"role": "system", "content": "..."}
@@ -88,6 +121,10 @@ class OpenAIClientWrapper:
     def set_model(self, model_name: str) -> None:
         """Change the model to use for subsequent calls."""
         self.model = model_name
+
+    def set_system_prompt(self, system_prompt: Optional[str]) -> None:
+        """Change the system prompt prepended to every request; None disables it."""
+        self.system_prompt = system_prompt
 
     def set_api_key(self, api_key: Optional[str], base_url: Optional[str] = None) -> None:
         """Change API key (reinitializes underlying client)."""
@@ -163,6 +200,10 @@ class OpenAIClientWrapper:
 
         if prompt is not None:
             request_messages.append({"role": "user", "content": prompt})
+
+        # Prepend the configured system prompt unless one is already present
+        if self.system_prompt and (not request_messages or request_messages[0].get("role") != "system"):
+            request_messages = [{"role": "system", "content": self.system_prompt}] + request_messages
 
         # use the client to call the chat completions endpoint
         def payload():
@@ -266,7 +307,7 @@ base_url = os.environ.get("CBORG_BASE_URL", "https://api.cborg.lbl.gov")
 cborg = OpenAIClientWrapper(
     api_key=os.environ.get("CBORG_API_KEY"),
     base_url=base_url,
-    model="openai/gpt-5.2",
+    model="cborg-coder-max",
     default_temperature=0.0,
     max_retries=2,
     backoff_factor=1.0,
