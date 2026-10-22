@@ -225,33 +225,12 @@ clears stale results). The dialog's info alert reflects it.
 
 ### 2.9 Tests
 
-Backend (`tests/test_ai_prompts.py`, `tests/test_docs_retrieval.py`):
-- Contract tests: units/defaults block present; model-requirements block present with settings
-  (and absent without); multi-valued feature settings parsed like the app (`post_process` not an
-  enabled feature, `discrete`/`co_optimize` are); notes format rules asserted.
-- Stateless assertions: `clear_history()` called once and `prompt(..., add_to_history=False)` on
-  every autofill request.
-- Guard tests: dropped tables restored; `df_sets` dropped entries restored, omitted section
-  restored, malformed entries reverted, new entries flagged; legacy `data_input` wrapper
-  unwrapped; unknown top-level keys removed; malformed table entries reverted; new tables flagged
-  not blocked; no aliasing of the original scenario; unusable responses → `(None, notes)`;
-  endpoint-level: garbage scenario → `status: "error"` with valid `questions` preserved
-  (malformed dropped); guard notes appended to `updateNotes`.
-- Retrieval tests: enabled `waterQuality` biases retrieval to water-quality chunks that the plain
-  query misses; header records the docs version + `docs built` date; mismatch produces the
-  `WARNING`; matching versions produce none; missing metadata falls back.
-  (Tests rebuild temp indexes via a `_rebuild_index` helper that clears the per-path connection
-  cache — the cache previously made a remove+rebuild read stale data.)
+Main's original test suites are untouched and pass unchanged (frontend 32 suites / 252 tests;
+backend 94 tests — see Part 4). The AI-feature review tests were written separately for the
+author's own verification and live outside the main suite; they are documented in
+**`docs/ai-feature-tests.md`** (locations, coverage summary, and run commands).
 
-Frontend (`tests/bottombar.test.tsx`, `tests/aiprompt.test.tsx`):
-- New test: validate → close dialog → "AI Fill Inputs" → the AI dialog receives
-  `validationFindings` matching the validation result. The dialog mock now captures props.
-- New test: an error response carrying `questions` (guard rejection) surfaces them with answer
-  fields.
-- New test: answering questions inline sends a `Q:/A:` transcript on the follow-up run, includes
-  the original prompt, and omits unanswered questions.
-
-**Verification:** 38 AI tests + 47 backend suites + 260 frontend tests pass; `tsc --noEmit` clean.
+**Verification:** main's suites pass on this branch; `tsc --noEmit` clean.
 
 ---
 
@@ -263,7 +242,7 @@ A follow-up review of the whole branch found and fixed four issues:
    `"false"/"post_process"/"discrete"` and `hydraulics` as `"false"/"post_process"/"co_optimize"/"co_optimize_linearized"`.
    The original `"true"/"1"` check mislabeled `post_process` (no input tables required) as an
    enabled feature and missed `discrete`/`co_optimize*` (tables required). Fixed with per-feature
-   active-value lists matching the app's dropdowns; covered by new contract tests.
+   active-value lists matching the app's dropdowns (review tests in `docs/ai-feature-tests.md`).
 2. **`df_sets` was unprotected** (`scenario_handler.py`) — the save merge replaces the whole
    `df_sets` object, so a response omitting set entries silently lost them. The guard now
    restores dropped/omitted set entries, reverts malformed ones, and flags additions, mirroring
@@ -297,7 +276,7 @@ A follow-up review of the whole branch found and fixed four issues:
    "Fix with AI" button was passed unconditionally, so on a setup without an API key a failing
    validation showed the button, and clicking it did nothing (the AI dialog is not rendered when
    AI is unavailable). The handler is now only passed when `isAIAvailable`, so a non-AI setup
-   shows exactly main's validation dialog. Covered by a both-ways availability test.
+   shows exactly main's validation dialog (review tests in `docs/ai-feature-tests.md`).
 
 **Non-AI compatibility audit:** every addition is inert without AI configured — the system
 prompt, docs retrieval, prompt blocks (requirements/units/rules), stateless calls, and the
@@ -305,6 +284,21 @@ response guard only execute inside the AI-gated backend flows; the router's
 `validation_findings` is an optional body field; and the frontend additions (questions panel,
 answer fields, findings auto-attach, diff toggle) live inside the AI dialog or behind
 `isAIAvailable` gates. The validation, save, map-import, and optimization paths are untouched.
+
+---
+
+## Part 4 — Main test suite verification
+
+Main's original test files are **byte-identical to `main`** on this branch (`git diff main` is
+empty for `electron/ui/src/tests/*.test.tsx` and `backend/tests/`) and pass unchanged:
+
+- Frontend: 32 suites / **252 tests pass** — run with
+  `CI=true npm test -- --testPathIgnorePatterns=aifeature` (the AI-feature review tests live in
+  `src/tests/aifeature/` and are the only thing that flag excludes).
+- Backend: **94 tests pass** across all 13 of main's test modules
+  (`python -m unittest <modules>` from `backend/tests` with
+  `PYTHONPATH=backend:backend/tests`; ~2.5 minutes — two modules solve real optimization models).
+- Typecheck: `tsc --noEmit` clean.
 
 ---
 
@@ -318,6 +312,9 @@ answer fields, findings auto-attach, diff toggle) live inside the AI dialog or b
 ---
 
 ## Appendix — Full diff vs `main`
+
+Excludes the AI-feature review tests (`backend/tests_ai/`, `electron/ui/src/tests/aifeature/`)
+and the two docs files; those are personal review artifacts, not feature code.
 
 ```diff
 diff --git a/backend/app/internal/ai/client.py b/backend/app/internal/ai/client.py
@@ -1376,385 +1373,6 @@ index 0000000..a18e2b2
 +print(f"Built:   {meta.get('built_at')} from {meta.get('docs_dir')}")
 +print(f"Chunks:  {meta.get('chunk_count')} ({meta.get('chunks_per_doc')})")
 +print("Try:  search('pipeline capacity')   show(0)   doc('strategic')")
-diff --git a/backend/tests/test_ai_prompts.py b/backend/tests/test_ai_prompts.py
-new file mode 100644
-index 0000000..f44dde9
---- /dev/null
-+++ b/backend/tests/test_ai_prompts.py
-@@ -0,0 +1,231 @@
-+import json
-+import unittest
-+from unittest import mock
-+
-+from app.internal import scenario_handler as handler_module
-+from app.internal.scenario_handler import sanitize_ai_updated_scenario
-+from app.internal.util import FormatPrompt
-+
-+
-+class FormatPromptContractTests(unittest.TestCase):
-+    def test_prompt_contains_response_contract(self):
-+        prompt = FormatPrompt("fill completions demand", data={"df_parameters": {"PadRates": {}}},
-+                              optimization_settings={})
-+        for expected in ("'updatedScenario'", "'questions'", "'updateNotes'", "'status'",
-+                         "one note per distinct change", "'questions', not in updateNotes",
-+                         "Here is the prompt:", "fill completions demand", "PadRates"):
-+            self.assertIn(expected, prompt)
-+
-+    def test_prompt_includes_validation_findings(self):
-+        findings = [{"code": "missing_value", "table": "PadRates", "row": ["Pad1"], "severity": "error"}]
-+        prompt = FormatPrompt("fix the issues", data={"df_parameters": {}},
-+                              optimization_settings={}, validation_findings=findings)
-+        self.assertIn("validation findings", prompt)
-+        self.assertIn("PadRates", prompt)
-+        self.assertIn("Prioritize resolving these", prompt)
-+
-+    def test_prompt_without_findings_omits_block(self):
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}}, optimization_settings={})
-+        self.assertNotIn("validation findings", prompt)
-+
-+    def test_prompt_includes_units_and_defaults(self):
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}}, optimization_settings={})
-+        self.assertIn("Units and defaults", prompt)
-+        self.assertIn("bbl", prompt)
-+        self.assertIn("not zeros", prompt)
-+
-+    def test_prompt_includes_model_requirements_from_settings(self):
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
-+                              optimization_settings={"waterQuality": "true", "solver": "cbc"})
-+        self.assertIn("Model requirements", prompt)
-+        self.assertIn("water_quality", prompt)
-+        self.assertIn("Enabled features: water_quality", prompt)
-+
-+    def test_prompt_without_settings_omits_model_requirements(self):
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}})
-+        self.assertNotIn("Model requirements", prompt)
-+
-+    def test_multi_valued_feature_settings_are_parsed_like_the_app(self):
-+        # "post_process" runs the model without those input tables; "discrete"
-+        # and "co_optimize" build them into the optimization.
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
-+                              optimization_settings={"waterQuality": "post_process"})
-+        self.assertNotIn("Enabled features: water_quality", prompt)
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
-+                              optimization_settings={"waterQuality": "discrete"})
-+        self.assertIn("Enabled features: water_quality", prompt)
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
-+                              optimization_settings={"hydraulics": "co_optimize"})
-+        self.assertIn("Enabled features: hydraulics", prompt)
-+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
-+                              optimization_settings={"hydraulics": "post_process"})
-+        self.assertNotIn("Enabled features: hydraulics", prompt)
-+
-+
-+class GenerateDataWithAIQuestionTests(unittest.TestCase):
-+    def setUp(self):
-+        self.scenario_id = 987654
-+        handler_module.scenario_handler.scenario_list[self.scenario_id] = {
-+            "id": self.scenario_id,
-+            "name": "question test",
-+            "optimization": {},
-+            "data_input": {"df_sets": {}, "df_parameters": {"PadRates": {"T01": [1]}}},
-+        }
-+        self.addCleanup(handler_module.scenario_handler.scenario_list.pop, self.scenario_id, None)
-+
-+    def _run(self, model_answer):
-+        with mock.patch.object(handler_module.cborg, "is_available", return_value=True), \
-+             mock.patch.object(handler_module.cborg, "clear_history") as clear_mock, \
-+             mock.patch.object(handler_module.cborg, "prompt",
-+                               return_value=json.dumps(model_answer)) as prompt_mock:
-+            result = handler_module.scenario_handler.generate_data_with_ai(self.scenario_id, "fill demand")
-+        clear_mock.assert_called_once()
-+        self.assertEqual(prompt_mock.call_args.kwargs.get("add_to_history"), False)
-+        return result
-+
-+    def test_valid_questions_pass_through(self):
-+        answer = self._run({"status": "success", "updatedScenario": {"df_parameters": {"PadRates": {"T01": [2]}}},
-+                            "questions": ["Which unit should demand use?"], "updateNotes": ["updated"]})
-+        self.assertEqual(answer["questions"], ["Which unit should demand use?"])
-+        self.assertEqual(answer["updatedScenario"]["df_parameters"]["PadRates"], {"T01": [2]})
-+
-+    def test_malformed_questions_are_dropped(self):
-+        answer = self._run({"status": "success", "updatedScenario": {"df_parameters": {}},
-+                            "questions": "which unit?", "updateNotes": []})
-+        self.assertNotIn("questions", answer)
-+
-+    def test_questions_survive_markdown_fences(self):
-+        fenced = "```json\n" + json.dumps({"status": "success", "updatedScenario": {"df_parameters": {}},
-+                                           "updateNotes": [], "questions": ["How many periods?"]}) + "\n```"
-+        with mock.patch.object(handler_module.cborg, "is_available", return_value=True), \
-+             mock.patch.object(handler_module.cborg, "prompt", return_value=fenced):
-+            answer = handler_module.scenario_handler.generate_data_with_ai(self.scenario_id, "fill demand")
-+        self.assertEqual(answer["questions"], ["How many periods?"])
-+
-+    def test_questions_only_response_has_no_updated_scenario(self):
-+        answer = self._run({"status": "success", "updateNotes": [], "questions": ["Which pads?"]})
-+        self.assertNotIn("updatedScenario", answer)
-+        self.assertEqual(answer["questions"], ["Which pads?"])
-+
-+    def test_string_update_notes_become_a_list(self):
-+        result = self._run({"status": "success", "updatedScenario": {"df_parameters": {}},
-+                            "updateNotes": "No tables were changed.", "questions": ["Which pads?"]})
-+        self.assertEqual(result["updateNotes"][0], "No tables were changed.")
-+        self.assertTrue(any("AI guard" in note for note in result["updateNotes"]))
-+
-+    def test_guard_rejects_unusable_scenario_through_endpoint(self):
-+        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [], "questions": []})
-+        self.assertEqual(result["status"], "error")
-+        self.assertIn("no updates were applied", result["errorMessage"])
-+        self.assertNotIn("updatedScenario", result)
-+
-+    def test_guard_rejection_preserves_valid_questions(self):
-+        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
-+                            "questions": ["Which pads?", "Which units?"]})
-+        self.assertEqual(result["status"], "error")
-+        self.assertEqual(result["questions"], ["Which pads?", "Which units?"])
-+
-+    def test_guard_rejection_drops_malformed_questions(self):
-+        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
-+                            "questions": ["Which pads?", "   ", 42]})
-+        self.assertEqual(result["status"], "error")
-+        self.assertNotIn("questions", result)
-+
-+    def test_guard_notes_are_appended_to_update_notes(self):
-+        result = self._run({"status": "success",
-+                            "updatedScenario": {"df_sets": {}, "df_parameters": {}},
-+                            "updateNotes": ["Only sets were updated."], "questions": []})
-+        self.assertEqual(result["updatedScenario"]["df_parameters"]["PadRates"], {"T01": [1]})
-+        self.assertIn("Only sets were updated.", result["updateNotes"])
-+        self.assertTrue(any("AI guard" in note and "dropped" in note for note in result["updateNotes"]))
-+
-+
-+class SanitizeAiUpdatedScenarioTests(unittest.TestCase):
-+    def setUp(self):
-+        self.original = {
-+            "df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"]},
-+            "df_parameters": {
-+                "PadRates": {"ProductionPads": ["P1"], "T01": [100]},
-+                "CapCost": {"ProductionPads": ["P1"], "VALUE": [10]},
-+            },
-+        }
-+
-+    def test_valid_response_passes_through(self):
-+        response = {"df_sets": {"ProductionPads": ["P1"]}, "df_parameters": {"PadRates": {"T01": [200]}}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_parameters"]["PadRates"], {"T01": [200]})
-+        self.assertEqual(cleaned["df_parameters"]["CapCost"], self.original["df_parameters"]["CapCost"])
-+        self.assertTrue(any("dropped" in note and "CapCost" in note for note in notes))
-+
-+    def test_dropped_tables_are_restored(self):
-+        response = {"df_sets": {}, "df_parameters": {"PadRates": {"T01": [200]}}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_parameters"]["CapCost"], self.original["df_parameters"]["CapCost"])
-+        self.assertIn("CapCost", notes[0])
-+
-+    def test_unknown_top_level_keys_are_removed(self):
-+        response = {"df_sets": {}, "df_parameters": {}, "surprise_section": {"a": 1}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertNotIn("surprise_section", cleaned)
-+        self.assertTrue(any("surprise_section" in note for note in notes))
-+
-+    def test_malformed_table_entries_revert_to_original(self):
-+        response = {"df_parameters": {"PadRates": "not a table", "Extra": [1, 2]}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_parameters"]["PadRates"], self.original["df_parameters"]["PadRates"])
-+        self.assertNotIn("Extra", cleaned["df_parameters"])
-+        self.assertTrue(any("malformed" in note for note in notes))
-+
-+    def test_new_tables_are_flagged_not_blocked(self):
-+        response = {"df_parameters": {"PadRates": {"T01": [1]}, "NewCost": {"T01": [5]}}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertIn("NewCost", cleaned["df_parameters"])
-+        self.assertTrue(any("NewCost" in note and "review" in note for note in notes))
-+
-+    def test_legacy_data_input_wrapper_is_unwrapped(self):
-+        response = {"data_input": {"df_sets": {"ProductionPads": ["P1"]},
-+                                   "df_parameters": {"PadRates": {"T01": [200]}}}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertNotIn("data_input", cleaned)
-+        self.assertEqual(cleaned["df_parameters"]["PadRates"], {"T01": [200]})
-+
-+    def test_dropped_set_entries_are_restored(self):
-+        response = {"df_sets": {"ProductionPads": ["P1"]}, "df_parameters": {}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
-+        self.assertTrue(any("dropped set entries" in note for note in notes))
-+
-+    def test_malformed_set_entries_are_reverted(self):
-+        response = {"df_sets": {"ProductionPads": "oops"}, "df_parameters": {}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
-+        self.assertTrue(any("malformed set entries" in note for note in notes))
-+
-+    def test_new_set_entries_are_flagged_not_blocked(self):
-+        response = {"df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"], "RiverIntakes": ["R1"]},
-+                    "df_parameters": {}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_sets"]["RiverIntakes"], ["R1"])
-+        self.assertTrue(any("new set entries" in note and "RiverIntakes" in note for note in notes))
-+
-+    def test_omitted_df_sets_section_is_restored(self):
-+        response = {"df_parameters": {"PadRates": {"T01": [200]}}}
-+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
-+        self.assertEqual(cleaned["df_sets"], self.original["df_sets"])
-+        self.assertTrue(any("omitted the df_sets section" in note for note in notes))
-+
-+    def test_original_objects_are_not_aliased(self):
-+        response = {"df_parameters": {"PadRates": {"T01": [200]}}}
-+        cleaned, _ = sanitize_ai_updated_scenario(self.original, response)
-+        cleaned["df_parameters"]["PadRates"]["T01"][0] = 999
-+        self.assertEqual(self.original["df_parameters"]["PadRates"]["T01"][0], 100)
-+
-+    def test_unusable_responses_return_none(self):
-+        for bad in ("a string", 42, {"df_sets": {}}, None):
-+            cleaned, notes = sanitize_ai_updated_scenario(self.original, bad)
-+            self.assertIsNone(cleaned)
-+            self.assertTrue(notes and "no updates were applied" in notes[0])
-+
-+
-+if __name__ == "__main__":
-+    unittest.main()
-diff --git a/backend/tests/test_docs_retrieval.py b/backend/tests/test_docs_retrieval.py
-new file mode 100644
-index 0000000..818147a
---- /dev/null
-+++ b/backend/tests/test_docs_retrieval.py
-@@ -0,0 +1,136 @@
-+import os
-+import sqlite3
-+import tempfile
-+import unittest
-+from pathlib import Path
-+from unittest import mock
-+
-+from app.internal.ai import docs
-+
-+
-+def _build_index(path, rows, metadata=None):
-+    connection = sqlite3.connect(path)
-+    try:
-+        connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-+        connection.execute(
-+            "CREATE VIRTUAL TABLE chunks USING fts5(doc UNINDEXED, title UNINDEXED, body)"
-+        )
-+        connection.executemany(
-+            "INSERT INTO chunks (doc, title, body) VALUES (?, ?, ?)", rows
-+        )
-+        if metadata:
-+            connection.executemany(
-+                "INSERT INTO metadata (key, value) VALUES (?, ?)", metadata.items()
-+            )
-+        connection.commit()
-+    finally:
-+        connection.close()
-+
-+
-+class DocsRetrievalTests(unittest.TestCase):
-+    def setUp(self):
-+        self._tmp = tempfile.TemporaryDirectory()
-+        self.index_path = Path(self._tmp.name) / "index.sqlite"
-+        _build_index(self.index_path, [
-+            ("strategic", "Terminology", "A wellpad is a site where completions water is generated."),
-+            ("strategic", "Mathematical Program Formulation (part 3)",
-+             "Pipeline capacity constraints limit flow between nodes; the initial pipeline capacity "
-+             "may be expanded with 1 if pipeline expansion is enabled."),
-+            ("water_treatment", "Treatment Component Removal Efficiency",
-+             "Removal efficiency describes the fraction of a water quality component removed by a treatment site."),
-+            ("strategic", "Strategic Model Mathematical Notation (part 5)",
-+             "The hourly trucking cost applies to each trucked route per period."),
-+        ])
-+        self._previous = os.environ.get("PARETO_DOCS_INDEX")
-+        os.environ["PARETO_DOCS_INDEX"] = str(self.index_path)
-+
-+    def _rebuild_index(self, rows, metadata=None):
-+        os.remove(self.index_path)
-+        _build_index(self.index_path, rows, metadata)
-+        docs._index_connections.clear()
-+
-+    def tearDown(self):
-+        if self._previous is None:
-+            os.environ.pop("PARETO_DOCS_INDEX", None)
-+        else:
-+            os.environ["PARETO_DOCS_INDEX"] = self._previous
-+        self._tmp.cleanup()
-+
-+    def test_query_tokens_split_camelcase_and_drop_stopwords(self):
-+        tokens = docs.query_tokens("Why is TruckingHourlyCost exceeded on the Pipeline for X1?")
-+        self.assertIn("trucking", tokens)
-+        self.assertIn("hourly", tokens)
-+        self.assertIn("cost", tokens)
-+        self.assertIn("pipeline", tokens)
-+        self.assertNotIn("the", tokens)
-+        self.assertNotIn("why", tokens)
-+
-+    def test_retrieval_includes_relevant_chunk(self):
-+        result = docs.diagnosis_reference_docs({}, "pipeline capacity exceeded, model infeasible")
-+        self.assertIn("Pipeline capacity constraints", result)
-+        self.assertIn("[strategic]", result)
-+
-+    def test_camel_case_query_matches_worded_doc(self):
-+        result = docs.prompt_reference_docs({}, "adjust TruckingHourlyCost for all routes")
-+        self.assertIn("hourly trucking cost", result)
-+
-+    def test_terminology_always_included_even_without_matches(self):
-+        result = docs.prompt_reference_docs({}, "zzzqqq unrelated gibberish")
-+        self.assertIn("Terminology", result)
-+        self.assertIn("wellpad", result)
-+        self.assertNotIn("Pipeline capacity constraints", result)
-+
-+    def test_diagnostics_budget_limits_total_size(self):
-+        big_body = "pipeline capacity " + ("filler sentence about capacity. " * 400)
-+        self._rebuild_index([
-+            ("strategic", f"Big section (part {part})", big_body) for part in range(1, 21)
-+        ] + [("strategic", "Terminology", "terminology body")])
-+        result = docs.diagnosis_reference_docs({}, "pipeline capacity")
-+        self.assertLessEqual(len(result), 1000 + 32000 + 2000)
-+
-+    def test_missing_index_returns_empty_without_failing(self):
-+        os.environ["PARETO_DOCS_INDEX"] = str(Path(self._tmp.name) / "missing.sqlite")
-+        self.assertEqual(docs.prompt_reference_docs({}, "anything"), "")
-+        self.assertEqual(docs.diagnosis_reference_docs({}, "anything"), "")
-+
-+    def test_enabled_feature_settings_bias_retrieval(self):
-+        self._rebuild_index([
-+            ("strategic", "Terminology", "terminology body"),
-+            ("water_treatment", "Water Quality Components",
-+             "Water quality components define concentration limits that reuse must satisfy."),
-+        ])
-+        plain = docs.prompt_reference_docs({}, "fill the demand inputs")
-+        self.assertNotIn("Water Quality Components", plain)
-+        biased = docs.prompt_reference_docs({"waterQuality": "true"}, "fill the demand inputs")
-+        self.assertIn("Water Quality Components", biased)
-+
-+    def test_header_records_docs_version_and_warns_on_mismatch(self):
-+        self._rebuild_index([
-+            ("strategic", "Terminology", "terminology body"),
-+        ], metadata={"pareto_version": "1.0.0", "built_at": "2026-01-15T00:00:00Z"})
-+        with mock.patch.object(docs, "_installed_pareto_version", return_value="9.9.9"):
-+            result = docs.prompt_reference_docs({}, "fill demand")
-+        self.assertIn("grounded in PARETO 1.0.0", result)
-+        self.assertIn("WARNING", result)
-+        self.assertIn("9.9.9", result)
-+        self.assertIn("docs built 2026-01-15", result)
-+
-+    def test_header_has_no_warning_when_versions_match(self):
-+        self._rebuild_index([
-+            ("strategic", "Terminology", "terminology body"),
-+        ], metadata={"pareto_version": "1.2.dev0"})
-+        with mock.patch.object(docs, "_installed_pareto_version", return_value="1.2.dev0"):
-+            result = docs.prompt_reference_docs({}, "fill demand")
-+        self.assertIn("grounded in PARETO 1.2.dev0", result)
-+        self.assertNotIn("WARNING", result)
-+
-+    def test_header_falls_back_to_installed_version_without_metadata(self):
-+        with mock.patch.object(docs, "_installed_pareto_version", return_value="1.2.dev0"):
-+            result = docs.prompt_reference_docs({}, "fill demand")
-+        self.assertIn("does not record", result)
-+        self.assertIn("1.2.dev0", result)
-+        self.assertNotIn("WARNING", result)
-+
-+
-+if __name__ == "__main__":
-+    unittest.main()
 diff --git a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx b/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
 index ce2d02a..a5c518c 100644
 --- a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
@@ -2358,183 +1976,6 @@ index b72610f..a69ad92 100644
    };
  };
  
-diff --git a/electron/ui/src/tests/aicontracts.test.ts b/electron/ui/src/tests/aicontracts.test.ts
-index 06e381b..a53beba 100644
---- a/electron/ui/src/tests/aicontracts.test.ts
-+++ b/electron/ui/src/tests/aicontracts.test.ts
-@@ -251,3 +251,13 @@ test('invalid scenario IDs fail before sending a paid AI request', async () => {
-   });
-   expect(global.fetch).not.toHaveBeenCalled();
- });
-+
-+test('a questions-only AI response is valid and carries no scenario', async () => {
-+  respond({ status: 'success', questions: ['Which unit should demand use?'], updateNotes: [] });
-+  const result = await requestAIDataUpdate(50011, 0, 'Fill');
-+  expect(result).toEqual({
-+    status: 'success',
-+    updateNotes: [],
-+    questions: ['Which unit should demand use?'],
-+  });
-+});
-diff --git a/electron/ui/src/tests/aiprompt.test.tsx b/electron/ui/src/tests/aiprompt.test.tsx
-index e547280..2e2555e 100644
---- a/electron/ui/src/tests/aiprompt.test.tsx
-+++ b/electron/ui/src/tests/aiprompt.test.tsx
-@@ -185,3 +185,80 @@ test('malformed diagnosis never reports success and an explicit retry can recove
-   expect(context.status).toBe('success');
-   expect(context.diagnosis).toEqual(diagnosis);
- });
-+
-+test('validation findings are sent with the fill request when provided', async () => {
-+  render(<View />);
-+  await waitFor(() => expect(context.isAvailable).toBe(true));
-+  const findings = [{ code: 'missing_value', table: 'PadRates', severity: 'error' }];
-+  act(() => {
-+    void context.runPrompt(0, 'Fix the findings', findings);
-+  });
-+  expect(requests).toHaveLength(1);
-+  const updateCall = (global.fetch as jest.Mock).mock.calls.find((call) =>
-+    String(call[0]).includes('request_ai_data_update'));
-+  const body = JSON.parse(updateCall[1].body);
-+  expect(body.prompt).toBe('Fix the findings');
-+  expect(body.validation_findings).toEqual(findings);
-+  await act(async () => requests[0].resolve(response(filled)));
-+  expect(context.status).toBe('success');
-+});
-+
-+test('multi-line update notes render as one scannable bullet per line', async () => {
-+  render(<View dialog />);
-+  await waitFor(() => expect(context.isAvailable).toBe(true));
-+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill' } });
-+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
-+  await act(async () => requests[0].resolve(response({
-+    status: 'success',
-+    updatedScenario: { df_parameters: { PadRates: { T01: [0] } } },
-+    updateNotes: ['Interpreted the request as filling missing set data.\n- df_sets: added ProductionPads [PP01]\n- df_sets: added StorageSites [S02]'],
-+  })));
-+  expect(screen.getByText('Interpreted the request as filling missing set data.')).toBeVisible();
-+  expect(screen.getByText('df_sets: added ProductionPads [PP01]')).toBeVisible();
-+  expect(screen.getByText('df_sets: added StorageSites [S02]')).toBeVisible();
-+});
-+
-+test('a guard rejection with questions surfaces the questions for a follow-up', async () => {
-+  render(<View dialog />);
-+  await waitFor(() => expect(context.isAvailable).toBe(true));
-+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill' } });
-+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
-+  await act(async () => requests[0].resolve(response({
-+    status: 'error',
-+    errorMessage: 'The AI response did not include the df_parameters input tables, so no updates were applied.',
-+    questions: ['Which pads should demand use?'],
-+  })));
-+  expect(context.status).toBe('error');
-+  expect(context.questions).toEqual(['Which pads should demand use?']);
-+  expect(screen.getByLabelText('Answer to: Which pads should demand use?')).toBeVisible();
-+});
-+
-+test('questions are answered inline and sent as a Q/A transcript on the next run', async () => {
-+  render(<View dialog />);
-+  await waitFor(() => expect(context.isAvailable).toBe(true));
-+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill demand' } });
-+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
-+  await act(async () => requests[0].resolve(response({
-+    status: 'success', updateNotes: [],
-+    questions: ['Which unit should demand use?', 'Which solver should the scenario use?'],
-+  })));
-+  expect(context.questions).toEqual(['Which unit should demand use?', 'Which solver should the scenario use?']);
-+  expect(context.status).toBe('success');
-+  expect(screen.queryByRole('button', { name: 'Save Updates' })).not.toBeInTheDocument();
-+  fireEvent.change(screen.getByLabelText('Answer to: Which unit should demand use?'),
-+    { target: { value: 'Unit W1' } });
-+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
-+  expect(requests).toHaveLength(2);
-+  const followUp = (global.fetch as jest.Mock).mock.calls
-+    .filter((call) => call[1] && typeof call[1].body === 'string')
-+    .map((call) => JSON.parse(call[1].body))
-+    .filter((parsed) => typeof parsed.prompt === 'string'
-+      && parsed.prompt.includes('Answers to your previous questions:'));
-+  expect(followUp).toHaveLength(1);
-+  expect(followUp[0].prompt).toContain('Fill demand');
-+  expect(followUp[0].prompt).toContain('Q: Which unit should demand use?');
-+  expect(followUp[0].prompt).toContain('A: Unit W1');
-+  expect(followUp[0].prompt).not.toContain('Which solver');
-+  await act(async () => requests[1].resolve(response({ status: 'success', updateNotes: [], questions: [] })));
-+  expect(context.status).toBe('success');
-+});
-diff --git a/electron/ui/src/tests/bottombar.test.tsx b/electron/ui/src/tests/bottombar.test.tsx
-index eb3eda0..b9073f2 100644
---- a/electron/ui/src/tests/bottombar.test.tsx
-+++ b/electron/ui/src/tests/bottombar.test.tsx
-@@ -1,13 +1,24 @@
--import { render, screen } from '@testing-library/react';
-+import { render, screen, waitFor, fireEvent, act } from '@testing-library/react';
- import Bottombar from "../components/Bottombar/Bottombar"
- import mockScenario from './data/mockScenario.json'
- import * as React from 'react'
-+import { modelBuilt } from './fixtures/validation';
- 
--jest.mock("../components/AIPromptDialog/AIPromptDialog", () => () => null);
-+let dialogProps: any = null;
-+jest.mock("../components/AIPromptDialog/AIPromptDialog", () => (props: any) => {
-+  dialogProps = props;
-+  return null;
-+});
- let mockAIAvailable = false;
- jest.mock("../context/AIPromptContext", () => ({useAIPrompt: () => ({isAvailable: mockAIAvailable})}));
- 
--beforeEach(() => { mockAIAvailable = false; });
-+const originalFetch = global.fetch;
-+beforeEach(() => {
-+  mockAIAvailable = false;
-+  dialogProps = null;
-+  global.fetch = originalFetch;
-+});
-+afterEach(() => { global.fetch = originalFetch; });
- 
- const mockFunction = () => {
-     console.log("function");
-@@ -24,6 +35,41 @@ test.each([false, true])('AI input filling follows availability (%s)', (availabl
-     expect(screen.getByRole('button', {name: /Generate Spreadsheet From Network/i})).toBeEnabled();
- });
- 
-+test('standalone AI fill attaches the latest validation findings', async () => {
-+    mockAIAvailable = true;
-+    global.fetch = jest.fn((url: string) => {
-+      if (String(url).includes('/validate_scenario/')) {
-+        return Promise.resolve({ok: true, status: 200, json: async () => modelBuilt});
-+      }
-+      return Promise.resolve({ok: true, status: 200, json: async () => ({})});
-+    }) as jest.Mock;
-+    render(<Bottombar section={0} backgroundTasks={[]} setDisableOptimize={jest.fn()}
-+      scenario={{...mockScenario, results: {status: 'Incomplete'}}} />);
-+    fireEvent.click(screen.getByRole('button', {name: /Validate Scenario/i}));
-+    await waitFor(() => expect(screen.getByRole('button', {name: 'Close'})).toBeEnabled());
-+    await act(async () => { fireEvent.click(screen.getByRole('button', {name: 'Close'})); });
-+    await waitFor(() => expect(screen.getByRole('button', {name: /AI Fill Inputs/i})).toBeEnabled());
-+    await act(async () => { fireEvent.click(screen.getByRole('button', {name: /AI Fill Inputs/i})); });
-+    expect(dialogProps).not.toBeNull();
-+    expect(dialogProps.validationFindings).toMatchObject({state: 'model_built', model_check: 'passed'});
-+});
-+
-+test.each([false, true])('Fix with AI follows AI availability (%s)', async (available) => {
-+    mockAIAvailable = available;
-+    const infeasible = {...modelBuilt, valid: false, state: 'infeasible', feasibility: 'infeasible'};
-+    global.fetch = jest.fn((url: string) => {
-+      if (String(url).includes('/validate_scenario/')) {
-+        return Promise.resolve({ok: true, status: 200, json: async () => infeasible});
-+      }
-+      return Promise.resolve({ok: true, status: 200, json: async () => ({})});
-+    }) as jest.Mock;
-+    render(<Bottombar section={0} backgroundTasks={[]} setDisableOptimize={jest.fn()}
-+      scenario={{...mockScenario, results: {status: 'Incomplete'}}} />);
-+    fireEvent.click(screen.getByRole('button', {name: /Validate Scenario/i}));
-+    await waitFor(() => expect(screen.getByRole('button', {name: 'Close'})).toBeEnabled());
-+    expect(Boolean(screen.queryByRole('button', {name: /Fix with AI/i}))).toBe(available);
-+});
-+
- 
- test('test bottom bar: data input section', () => {
-     render( <Bottombar 
 diff --git a/electron/ui/src/types/ai.ts b/electron/ui/src/types/ai.ts
 index a94d6b0..153e172 100644
 --- a/electron/ui/src/types/ai.ts

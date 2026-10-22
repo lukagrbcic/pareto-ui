@@ -251,13 +251,3 @@ test('invalid scenario IDs fail before sending a paid AI request', async () => {
   });
   expect(global.fetch).not.toHaveBeenCalled();
 });
-
-test('a questions-only AI response is valid and carries no scenario', async () => {
-  respond({ status: 'success', questions: ['Which unit should demand use?'], updateNotes: [] });
-  const result = await requestAIDataUpdate(50011, 0, 'Fill');
-  expect(result).toEqual({
-    status: 'success',
-    updateNotes: [],
-    questions: ['Which unit should demand use?'],
-  });
-});
