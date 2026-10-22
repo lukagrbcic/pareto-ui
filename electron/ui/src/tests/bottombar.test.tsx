@@ -54,6 +54,22 @@ test('standalone AI fill attaches the latest validation findings', async () => {
     expect(dialogProps.validationFindings).toMatchObject({state: 'model_built', model_check: 'passed'});
 });
 
+test.each([false, true])('Fix with AI follows AI availability (%s)', async (available) => {
+    mockAIAvailable = available;
+    const infeasible = {...modelBuilt, valid: false, state: 'infeasible', feasibility: 'infeasible'};
+    global.fetch = jest.fn((url: string) => {
+      if (String(url).includes('/validate_scenario/')) {
+        return Promise.resolve({ok: true, status: 200, json: async () => infeasible});
+      }
+      return Promise.resolve({ok: true, status: 200, json: async () => ({})});
+    }) as jest.Mock;
+    render(<Bottombar section={0} backgroundTasks={[]} setDisableOptimize={jest.fn()}
+      scenario={{...mockScenario, results: {status: 'Incomplete'}}} />);
+    fireEvent.click(screen.getByRole('button', {name: /Validate Scenario/i}));
+    await waitFor(() => expect(screen.getByRole('button', {name: 'Close'})).toBeEnabled());
+    expect(Boolean(screen.queryByRole('button', {name: /Fix with AI/i}))).toBe(available);
+});
+
 
 test('test bottom bar: data input section', () => {
     render( <Bottombar 

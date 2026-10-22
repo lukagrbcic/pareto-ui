@@ -380,7 +380,7 @@ export default function Bottombar(props) {
         onSelectTable={handleSelectValidationTable}
         onCheckFeasibility={() => handleValidateScenario(true)}
         onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
-        onAskAI={handleFixValidationWithAI}
+        onAskAI={isAIAvailable ? handleFixValidationWithAI : undefined}
         onClose={handleCloseValidationDialog}
       />
     </Box>

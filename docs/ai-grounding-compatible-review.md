@@ -251,7 +251,7 @@ Frontend (`tests/bottombar.test.tsx`, `tests/aiprompt.test.tsx`):
 - New test: answering questions inline sends a `Q:/A:` transcript on the follow-up run, includes
   the original prompt, and omits unanswered questions.
 
-**Verification:** 38 AI tests + 47 backend suites + 258 frontend tests pass; `tsc --noEmit` clean.
+**Verification:** 38 AI tests + 47 backend suites + 260 frontend tests pass; `tsc --noEmit` clean.
 
 ---
 
@@ -293,6 +293,18 @@ A follow-up review of the whole branch found and fixed four issues:
    Unanswered questions are omitted; answers-only (empty prompt box) is allowed; fields are
    disabled while a request runs and reset when new questions arrive or the prompt is cleared.
    The backend contract is unchanged — the transcript is ordinary prompt text.
+6. **"Fix with AI" is now gated on AI availability** (`Bottombar.tsx`) — the validation dialog's
+   "Fix with AI" button was passed unconditionally, so on a setup without an API key a failing
+   validation showed the button, and clicking it did nothing (the AI dialog is not rendered when
+   AI is unavailable). The handler is now only passed when `isAIAvailable`, so a non-AI setup
+   shows exactly main's validation dialog. Covered by a both-ways availability test.
+
+**Non-AI compatibility audit:** every addition is inert without AI configured — the system
+prompt, docs retrieval, prompt blocks (requirements/units/rules), stateless calls, and the
+response guard only execute inside the AI-gated backend flows; the router's
+`validation_findings` is an optional body field; and the frontend additions (questions panel,
+answer fields, findings auto-attach, diff toggle) live inside the AI dialog or behind
+`isAIAvailable` gates. The validation, save, map-import, and optimization paths are untouched.
 
 ---
 
@@ -2103,7 +2115,7 @@ index ce2d02a..a5c518c 100644
                    </Box>
                  ))}
 diff --git a/electron/ui/src/components/Bottombar/Bottombar.tsx b/electron/ui/src/components/Bottombar/Bottombar.tsx
-index 3c7df1c..1081871 100644
+index 3c7df1c..17c8dad 100644
 --- a/electron/ui/src/components/Bottombar/Bottombar.tsx
 +++ b/electron/ui/src/components/Bottombar/Bottombar.tsx
 @@ -50,6 +50,7 @@ export default function Bottombar(props) {
@@ -2160,7 +2172,7 @@ index 3c7df1c..1081871 100644
          onSelectTable={handleSelectValidationTable}
          onCheckFeasibility={() => handleValidateScenario(true)}
          onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
-+        onAskAI={handleFixValidationWithAI}
++        onAskAI={isAIAvailable ? handleFixValidationWithAI : undefined}
          onClose={handleCloseValidationDialog}
        />
      </Box>
@@ -2450,7 +2462,7 @@ index e547280..2e2555e 100644
 +  expect(context.status).toBe('success');
 +});
 diff --git a/electron/ui/src/tests/bottombar.test.tsx b/electron/ui/src/tests/bottombar.test.tsx
-index eb3eda0..10a9ec7 100644
+index eb3eda0..b9073f2 100644
 --- a/electron/ui/src/tests/bottombar.test.tsx
 +++ b/electron/ui/src/tests/bottombar.test.tsx
 @@ -1,13 +1,24 @@
@@ -2481,7 +2493,7 @@ index eb3eda0..10a9ec7 100644
  
  const mockFunction = () => {
      console.log("function");
-@@ -24,6 +35,25 @@ test.each([false, true])('AI input filling follows availability (%s)', (availabl
+@@ -24,6 +35,41 @@ test.each([false, true])('AI input filling follows availability (%s)', (availabl
      expect(screen.getByRole('button', {name: /Generate Spreadsheet From Network/i})).toBeEnabled();
  });
  
@@ -2502,6 +2514,22 @@ index eb3eda0..10a9ec7 100644
 +    await act(async () => { fireEvent.click(screen.getByRole('button', {name: /AI Fill Inputs/i})); });
 +    expect(dialogProps).not.toBeNull();
 +    expect(dialogProps.validationFindings).toMatchObject({state: 'model_built', model_check: 'passed'});
++});
++
++test.each([false, true])('Fix with AI follows AI availability (%s)', async (available) => {
++    mockAIAvailable = available;
++    const infeasible = {...modelBuilt, valid: false, state: 'infeasible', feasibility: 'infeasible'};
++    global.fetch = jest.fn((url: string) => {
++      if (String(url).includes('/validate_scenario/')) {
++        return Promise.resolve({ok: true, status: 200, json: async () => infeasible});
++      }
++      return Promise.resolve({ok: true, status: 200, json: async () => ({})});
++    }) as jest.Mock;
++    render(<Bottombar section={0} backgroundTasks={[]} setDisableOptimize={jest.fn()}
++      scenario={{...mockScenario, results: {status: 'Incomplete'}}} />);
++    fireEvent.click(screen.getByRole('button', {name: /Validate Scenario/i}));
++    await waitFor(() => expect(screen.getByRole('button', {name: 'Close'})).toBeEnabled());
++    expect(Boolean(screen.queryByRole('button', {name: /Fix with AI/i}))).toBe(available);
 +});
 +
  
