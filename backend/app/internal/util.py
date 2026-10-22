@@ -432,10 +432,23 @@ def _model_requirements_block(optimization_settings):
         return ""
     if not isinstance(model_parameters, dict) or not model_parameters:
         return ""
-    feature_flags = ("water_quality", "hydraulics", "desalination_model",
-                     "infrastructure_timing", "subsurface_risk")
-    enabled = sorted(name for name in feature_flags
-                     if str(model_parameters.get(name, "false")).lower() in ("true", "1"))
+
+    def _enabled(name, active_values=None):
+        value = str(model_parameters.get(name, "false")).lower()
+        if active_values is not None:
+            return value in active_values
+        return value not in ("false", "0", "", "none")
+
+    # water_quality/hydraulics are multi-valued in the app ("post_process" runs
+    # the model without requiring those input tables; "discrete"/"co_optimize*"
+    # build them into the optimization).
+    enabled = sorted(name for name, active in (
+        ("water_quality", _enabled("water_quality", ("true", "1", "discrete"))),
+        ("hydraulics", _enabled("hydraulics", ("true", "1", "co_optimize", "co_optimize_linearized"))),
+        ("desalination_model", _enabled("desalination_model")),
+        ("infrastructure_timing", _enabled("infrastructure_timing")),
+        ("subsurface_risk", _enabled("subsurface_risk")),
+    ) if active)
     enabled_note = f" Enabled features: {', '.join(enabled)}." if enabled else ""
     return (
         "Model requirements for the current optimization settings (tailor fills to this configured "

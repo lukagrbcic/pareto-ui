@@ -69,6 +69,9 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     notes = []
     if not isinstance(updated_scenario, dict):
         return None, ["The AI response was not a valid scenario object, so no updates were applied."]
+    # Legacy provider responses wrap the inputs in a scenario-shaped object.
+    if "df_parameters" not in updated_scenario and isinstance(updated_scenario.get("data_input"), dict):
+        updated_scenario = updated_scenario["data_input"]
     if not isinstance(updated_scenario.get("df_parameters"), dict):
         return None, ["The AI response did not include the df_parameters input tables, so no updates were applied."]
     cleaned = deepcopy(updated_scenario)
@@ -96,6 +99,44 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     if added:
         notes.append("AI guard: the response added new table(s) " + ", ".join(added)
                      + "; review them before saving.")
+
+    # df_sets gets the same protection: the merge on save replaces the whole
+    # section, so dropped or malformed set entries would silently lose data.
+    if "df_sets" in cleaned or "df_sets" in original:
+        original_sets = original.get("df_sets") or {}
+        sets = cleaned.get("df_sets")
+        if not isinstance(sets, dict):
+            if "df_sets" in cleaned:
+                if "df_sets" in original:
+                    cleaned["df_sets"] = deepcopy(original_sets)
+                    notes.append("AI guard: replaced the malformed df_sets section with the original sets.")
+                else:
+                    cleaned.pop("df_sets", None)
+            elif original_sets:
+                cleaned["df_sets"] = deepcopy(original_sets)
+                notes.append("AI guard: the response omitted the df_sets section; the original sets were kept.")
+            else:
+                cleaned["df_sets"] = {}
+        else:
+            restored_sets = sorted(set_name for set_name in original_sets if set_name not in sets)
+            for set_name in restored_sets:
+                sets[set_name] = deepcopy(original_sets[set_name])
+            if restored_sets:
+                notes.append("AI guard: the response dropped set entries " + ", ".join(restored_sets)
+                             + "; the original value(s) were kept.")
+            malformed_sets = sorted(set_name for set_name, value in sets.items() if not isinstance(value, list))
+            for set_name in malformed_sets:
+                if set_name in original_sets:
+                    sets[set_name] = deepcopy(original_sets[set_name])
+                else:
+                    sets.pop(set_name, None)
+            if malformed_sets:
+                notes.append("AI guard: replaced malformed set entries with original values for "
+                             + ", ".join(malformed_sets) + ".")
+            added_sets = sorted(set_name for set_name in sets if set_name not in original_sets)
+            if added_sets:
+                notes.append("AI guard: the response added new set entries " + ", ".join(added_sets)
+                             + "; review them before saving.")
 
     allowed_keys = set(original) | {"df_sets", "df_parameters"}
     removed = sorted(key for key in cleaned if key not in allowed_keys)
@@ -865,7 +906,11 @@ class ScenarioHandler:
                 cleaned_scenario, guard_notes = sanitize_ai_updated_scenario(data_input, updatedScenario)
                 if cleaned_scenario is None:
                     _log.info(f"AI response failed the structural guard: {guard_notes[0]}")
-                    return {"status": "error", "errorMessage": guard_notes[0]}
+                    error_response = {"status": "error", "errorMessage": guard_notes[0]}
+                    questions = answer.get("questions")
+                    if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
+                        error_response["questions"] = [q.strip() for q in questions]
+                    return error_response
                 answer["updatedScenario"] = cleaned_scenario
             notes = answer.get("updateNotes")
             if isinstance(notes, str):

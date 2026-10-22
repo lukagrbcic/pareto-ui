@@ -218,6 +218,21 @@ test('multi-line update notes render as one scannable bullet per line', async ()
   expect(screen.getByText('df_sets: added StorageSites [S02]')).toBeVisible();
 });
 
+test('a guard rejection with questions surfaces the questions for a follow-up', async () => {
+  render(<View dialog />);
+  await waitFor(() => expect(context.isAvailable).toBe(true));
+  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
+  await act(async () => requests[0].resolve(response({
+    status: 'error',
+    errorMessage: 'The AI response did not include the df_parameters input tables, so no updates were applied.',
+    questions: ['Which pads should demand use?'],
+  })));
+  expect(context.status).toBe('error');
+  expect(context.questions).toEqual(['Which pads should demand use?']);
+  expect(screen.getByRole('button', { name: 'Which pads should demand use?' })).toBeVisible();
+});
+
 test('questions without a patch are surfaced for a follow-up instead of a save preview', async () => {
   render(<View dialog />);
   await waitFor(() => expect(context.isAvailable).toBe(true));

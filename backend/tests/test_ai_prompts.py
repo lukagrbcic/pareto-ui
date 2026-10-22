@@ -45,6 +45,22 @@ class FormatPromptContractTests(unittest.TestCase):
         prompt = FormatPrompt("fill demand", data={"df_parameters": {}})
         self.assertNotIn("Model requirements", prompt)
 
+    def test_multi_valued_feature_settings_are_parsed_like_the_app(self):
+        # "post_process" runs the model without those input tables; "discrete"
+        # and "co_optimize" build them into the optimization.
+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
+                              optimization_settings={"waterQuality": "post_process"})
+        self.assertNotIn("Enabled features: water_quality", prompt)
+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
+                              optimization_settings={"waterQuality": "discrete"})
+        self.assertIn("Enabled features: water_quality", prompt)
+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
+                              optimization_settings={"hydraulics": "co_optimize"})
+        self.assertIn("Enabled features: hydraulics", prompt)
+        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
+                              optimization_settings={"hydraulics": "post_process"})
+        self.assertNotIn("Enabled features: hydraulics", prompt)
+
 
 class GenerateDataWithAIQuestionTests(unittest.TestCase):
     def setUp(self):
@@ -103,6 +119,18 @@ class GenerateDataWithAIQuestionTests(unittest.TestCase):
         self.assertIn("no updates were applied", result["errorMessage"])
         self.assertNotIn("updatedScenario", result)
 
+    def test_guard_rejection_preserves_valid_questions(self):
+        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
+                            "questions": ["Which pads?", "Which units?"]})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["questions"], ["Which pads?", "Which units?"])
+
+    def test_guard_rejection_drops_malformed_questions(self):
+        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
+                            "questions": ["Which pads?", "   ", 42]})
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("questions", result)
+
     def test_guard_notes_are_appended_to_update_notes(self):
         result = self._run({"status": "success",
                             "updatedScenario": {"df_sets": {}, "df_parameters": {}},
@@ -115,7 +143,7 @@ class GenerateDataWithAIQuestionTests(unittest.TestCase):
 class SanitizeAiUpdatedScenarioTests(unittest.TestCase):
     def setUp(self):
         self.original = {
-            "df_sets": {"ProductionPads": ["P1"]},
+            "df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"]},
             "df_parameters": {
                 "PadRates": {"ProductionPads": ["P1"], "T01": [100]},
                 "CapCost": {"ProductionPads": ["P1"], "VALUE": [10]},
@@ -153,6 +181,38 @@ class SanitizeAiUpdatedScenarioTests(unittest.TestCase):
         cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
         self.assertIn("NewCost", cleaned["df_parameters"])
         self.assertTrue(any("NewCost" in note and "review" in note for note in notes))
+
+    def test_legacy_data_input_wrapper_is_unwrapped(self):
+        response = {"data_input": {"df_sets": {"ProductionPads": ["P1"]},
+                                   "df_parameters": {"PadRates": {"T01": [200]}}}}
+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
+        self.assertNotIn("data_input", cleaned)
+        self.assertEqual(cleaned["df_parameters"]["PadRates"], {"T01": [200]})
+
+    def test_dropped_set_entries_are_restored(self):
+        response = {"df_sets": {"ProductionPads": ["P1"]}, "df_parameters": {}}
+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
+        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
+        self.assertTrue(any("dropped set entries" in note for note in notes))
+
+    def test_malformed_set_entries_are_reverted(self):
+        response = {"df_sets": {"ProductionPads": "oops"}, "df_parameters": {}}
+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
+        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
+        self.assertTrue(any("malformed set entries" in note for note in notes))
+
+    def test_new_set_entries_are_flagged_not_blocked(self):
+        response = {"df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"], "RiverIntakes": ["R1"]},
+                    "df_parameters": {}}
+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
+        self.assertEqual(cleaned["df_sets"]["RiverIntakes"], ["R1"])
+        self.assertTrue(any("new set entries" in note and "RiverIntakes" in note for note in notes))
+
+    def test_omitted_df_sets_section_is_restored(self):
+        response = {"df_parameters": {"PadRates": {"T01": [200]}}}
+        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
+        self.assertEqual(cleaned["df_sets"], self.original["df_sets"])
+        self.assertTrue(any("omitted the df_sets section" in note for note in notes))
 
     def test_original_objects_are_not_aliased(self):
         response = {"df_parameters": {"PadRates": {"T01": [200]}}}

@@ -102,10 +102,11 @@ const failure = (value: unknown, path: string): AIPromptResponse | null => {
     error: optional(string),
     errorMessage: optional(string),
     detail: optional(string),
+    questions: optional(array(string)),
   })(value, path);
   const message = body.errorMessage || body.detail || body.error;
   if (!message?.trim()) throw new DecodeError(path, 'an AI error message');
-  return { status: 'error', errorMessage: message };
+  return { status: 'error', errorMessage: message, questions: body.questions };
 };
 
 export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) => {

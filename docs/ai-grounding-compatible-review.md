@@ -149,7 +149,13 @@ silently drop input tables or invent top-level sections, and saving it would cor
 `sanitize_ai_updated_scenario(original_data_input, updated_scenario)` now runs before the
 response is returned:
 
-- **Restores** any original table missing from the response (data loss prevented) and notes it.
+- **Unwraps** legacy scenario-shaped responses (`{"data_input": {...}}`) before validation — the
+  frontend decoder already tolerated this shape; the backend would have rejected it.
+- **Restores** any original table missing from `df_parameters` (data loss prevented) and notes it.
+- **Protects `df_sets` the same way** — the save merge replaces the whole section, so a response
+  omitting set entries would silently lose them. Dropped set entries are restored, malformed
+  entries (non-list) reverted to original, an omitted `df_sets` section restored with a note, and
+  newly added set entries flagged for review.
 - **Reverts** malformed (non-dict) table entries to original values.
 - **Removes** unrecognized top-level keys (anything outside the original keys plus
   `df_sets`/`df_parameters`) and notes it.
@@ -157,6 +163,8 @@ response is returned:
   table is legitimate) but never silent.
 - Returns `(None, notes)` for unusable responses (non-dict scenario, missing `df_parameters`) →
   the endpoint returns a clean `status: "error"` instead of a success the decoder would reject.
+  Valid `questions` in the same response are preserved on the error (and dropped if malformed),
+  and the frontend error path surfaces them as clickable follow-ups.
 
 Guard actions are appended to `updateNotes` ("AI guard: …") so the review dialog shows exactly
 what the guard changed — nothing about the guard is silent.
@@ -166,9 +174,15 @@ what the guard changed — nothing about the guard is silent.
 `_model_requirements_block(optimization_settings)` reuses the existing `prepare_config(..., "modelParameters")`
 to compute the effective model parameters (objective, solver, runtime, pipeline cost/capacity
 modes, water quality, hydraulics, desalination, …) and injects them into the autofill prompt with
-an "Enabled features: …" note for the feature flags. Previously `optimization_settings` was
-accepted but never reached the prompt body — the AI could not tailor fills to the configured
-model (e.g. water-quality tables required only when `waterQuality` is enabled).
+an "Enabled features: …" note. Previously `optimization_settings` was accepted but never reached
+the prompt body — the AI could not tailor fills to the configured model (e.g. water-quality
+tables required only when `waterQuality` is enabled).
+
+Feature parsing mirrors the app's real value space: `waterQuality` and `hydraulics` are
+multi-valued dropdowns (`"post_process"`, `"discrete"`, `"co_optimize"`, `"co_optimize_linearized"`),
+not booleans. `post_process` runs the model *without* requiring those input tables, so it is NOT
+listed as an enabled feature; `discrete` / `co_optimize*` are. Retrieval bias (2.7) stays broad
+on purpose — post-process docs are still useful context for results questions.
 
 ### 2.4 Units and defaults block (issue bullet 1) — `util.py`
 
@@ -212,24 +226,52 @@ clears stale results). The dialog's info alert reflects it.
 
 Backend (`tests/test_ai_prompts.py`, `tests/test_docs_retrieval.py`):
 - Contract tests: units/defaults block present; model-requirements block present with settings
-  (and absent without); notes format rules asserted.
+  (and absent without); multi-valued feature settings parsed like the app (`post_process` not an
+  enabled feature, `discrete`/`co_optimize` are); notes format rules asserted.
 - Stateless assertions: `clear_history()` called once and `prompt(..., add_to_history=False)` on
   every autofill request.
-- Guard tests: dropped tables restored; unknown top-level keys removed; malformed table entries
-  reverted; new tables flagged not blocked; no aliasing of the original scenario; unusable
-  responses → `(None, notes)`; endpoint-level: garbage scenario → `status: "error"`; guard notes
-  appended to `updateNotes`.
+- Guard tests: dropped tables restored; `df_sets` dropped entries restored, omitted section
+  restored, malformed entries reverted, new entries flagged; legacy `data_input` wrapper
+  unwrapped; unknown top-level keys removed; malformed table entries reverted; new tables flagged
+  not blocked; no aliasing of the original scenario; unusable responses → `(None, notes)`;
+  endpoint-level: garbage scenario → `status: "error"` with valid `questions` preserved
+  (malformed dropped); guard notes appended to `updateNotes`.
 - Retrieval tests: enabled `waterQuality` biases retrieval to water-quality chunks that the plain
   query misses; header records the docs version + `docs built` date; mismatch produces the
   `WARNING`; matching versions produce none; missing metadata falls back.
   (Tests rebuild temp indexes via a `_rebuild_index` helper that clears the per-path connection
   cache — the cache previously made a remove+rebuild read stale data.)
 
-Frontend (`tests/bottombar.test.tsx`):
+Frontend (`tests/bottombar.test.tsx`, `tests/aiprompt.test.tsx`):
 - New test: validate → close dialog → "AI Fill Inputs" → the AI dialog receives
   `validationFindings` matching the validation result. The dialog mock now captures props.
+- New test: an error response carrying `questions` (guard rejection) surfaces them as clickable
+  follow-ups.
 
-**Verification:** 30 AI tests + 47 backend suites + 257 frontend tests pass; `tsc --noEmit` clean.
+**Verification:** 38 AI tests + 47 backend suites + 258 frontend tests pass; `tsc --noEmit` clean.
+
+---
+
+## Part 2.5 — Second-pass bug review (this change set)
+
+A follow-up review of the whole branch found and fixed four issues:
+
+1. **Multi-valued settings were misparsed** (`util.py`) — the app stores `waterQuality` as
+   `"false"/"post_process"/"discrete"` and `hydraulics` as `"false"/"post_process"/"co_optimize"/"co_optimize_linearized"`.
+   The original `"true"/"1"` check mislabeled `post_process` (no input tables required) as an
+   enabled feature and missed `discrete`/`co_optimize*` (tables required). Fixed with per-feature
+   active-value lists matching the app's dropdowns; covered by new contract tests.
+2. **`df_sets` was unprotected** (`scenario_handler.py`) — the save merge replaces the whole
+   `df_sets` object, so a response omitting set entries silently lost them. The guard now
+   restores dropped/omitted set entries, reverts malformed ones, and flags additions, mirroring
+   the `df_parameters` protection.
+3. **Legacy wrapped responses were rejected** (`scenario_handler.py`) — the frontend decoder
+   unwraps `{"data_input": {...}}`-shaped responses; the backend guard errored on them instead.
+   It now unwraps before validating.
+4. **Guard rejections discarded questions** (`scenario_handler.py`, `contracts/ai.ts`,
+   `AIPromptContext.tsx`) — when the guard rejects an unusable scenario, valid `questions` from
+   the same response are now preserved on the error, the decoder carries them, and the dialog
+   renders them as clickable follow-ups.
 
 ---
 
@@ -729,10 +771,10 @@ new file mode 100644
 index 0000000..ed6ece4
 Binary files /dev/null and b/backend/app/internal/ai/pareto_docs_index.sqlite differ
 diff --git a/backend/app/internal/scenario_handler.py b/backend/app/internal/scenario_handler.py
-index a30199a..0aa9364 100644
+index a30199a..652f3a9 100644
 --- a/backend/app/internal/scenario_handler.py
 +++ b/backend/app/internal/scenario_handler.py
-@@ -56,6 +56,56 @@ def serialized(method):
+@@ -56,6 +56,97 @@ def serialized(method):
              return method(self, *args, **kwargs)
      return wrapped
  
@@ -749,6 +791,9 @@ index a30199a..0aa9364 100644
 +    notes = []
 +    if not isinstance(updated_scenario, dict):
 +        return None, ["The AI response was not a valid scenario object, so no updates were applied."]
++    # Legacy provider responses wrap the inputs in a scenario-shaped object.
++    if "df_parameters" not in updated_scenario and isinstance(updated_scenario.get("data_input"), dict):
++        updated_scenario = updated_scenario["data_input"]
 +    if not isinstance(updated_scenario.get("df_parameters"), dict):
 +        return None, ["The AI response did not include the df_parameters input tables, so no updates were applied."]
 +    cleaned = deepcopy(updated_scenario)
@@ -777,6 +822,44 @@ index a30199a..0aa9364 100644
 +        notes.append("AI guard: the response added new table(s) " + ", ".join(added)
 +                     + "; review them before saving.")
 +
++    # df_sets gets the same protection: the merge on save replaces the whole
++    # section, so dropped or malformed set entries would silently lose data.
++    if "df_sets" in cleaned or "df_sets" in original:
++        original_sets = original.get("df_sets") or {}
++        sets = cleaned.get("df_sets")
++        if not isinstance(sets, dict):
++            if "df_sets" in cleaned:
++                if "df_sets" in original:
++                    cleaned["df_sets"] = deepcopy(original_sets)
++                    notes.append("AI guard: replaced the malformed df_sets section with the original sets.")
++                else:
++                    cleaned.pop("df_sets", None)
++            elif original_sets:
++                cleaned["df_sets"] = deepcopy(original_sets)
++                notes.append("AI guard: the response omitted the df_sets section; the original sets were kept.")
++            else:
++                cleaned["df_sets"] = {}
++        else:
++            restored_sets = sorted(set_name for set_name in original_sets if set_name not in sets)
++            for set_name in restored_sets:
++                sets[set_name] = deepcopy(original_sets[set_name])
++            if restored_sets:
++                notes.append("AI guard: the response dropped set entries " + ", ".join(restored_sets)
++                             + "; the original value(s) were kept.")
++            malformed_sets = sorted(set_name for set_name, value in sets.items() if not isinstance(value, list))
++            for set_name in malformed_sets:
++                if set_name in original_sets:
++                    sets[set_name] = deepcopy(original_sets[set_name])
++                else:
++                    sets.pop(set_name, None)
++            if malformed_sets:
++                notes.append("AI guard: replaced malformed set entries with original values for "
++                             + ", ".join(malformed_sets) + ".")
++            added_sets = sorted(set_name for set_name in sets if set_name not in original_sets)
++            if added_sets:
++                notes.append("AI guard: the response added new set entries " + ", ".join(added_sets)
++                             + "; review them before saving.")
++
 +    allowed_keys = set(original) | {"df_sets", "df_parameters"}
 +    removed = sorted(key for key in cleaned if key not in allowed_keys)
 +    for key in removed:
@@ -789,7 +872,7 @@ index a30199a..0aa9364 100644
  class ScenarioHandler:
      """Manage the saved scenarios."""
  
-@@ -769,7 +819,7 @@ class ScenarioHandler:
+@@ -769,7 +860,7 @@ class ScenarioHandler:
  
      
      @time_it
@@ -798,7 +881,7 @@ index a30199a..0aa9364 100644
          _log.info(f"generate_data_with_ai user prompt: {user_prompt}")
          try:
  
-@@ -785,18 +835,21 @@ class ScenarioHandler:
+@@ -785,18 +876,21 @@ class ScenarioHandler:
                  "detail": "AI client is not configured. Provide an API key to enable AI features."
              }
          if data_input:
@@ -824,7 +907,7 @@ index a30199a..0aa9364 100644
  
              ## sample prompt: Can you fill in completions demand with 10000 barrels in each time period
  
-@@ -805,8 +858,36 @@ class ScenarioHandler:
+@@ -805,8 +899,40 @@ class ScenarioHandler:
              if status == "error":
                  _log.info(f"error response from AI: {answer.get('errorMessage')}")
                  return answer
@@ -836,7 +919,11 @@ index a30199a..0aa9364 100644
 +                cleaned_scenario, guard_notes = sanitize_ai_updated_scenario(data_input, updatedScenario)
 +                if cleaned_scenario is None:
 +                    _log.info(f"AI response failed the structural guard: {guard_notes[0]}")
-+                    return {"status": "error", "errorMessage": guard_notes[0]}
++                    error_response = {"status": "error", "errorMessage": guard_notes[0]}
++                    questions = answer.get("questions")
++                    if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
++                        error_response["questions"] = [q.strip() for q in questions]
++                    return error_response
 +                answer["updatedScenario"] = cleaned_scenario
 +            notes = answer.get("updateNotes")
 +            if isinstance(notes, str):
@@ -862,7 +949,7 @@ index a30199a..0aa9364 100644
              return answer
          else:
              return {
-@@ -877,11 +958,14 @@ class ScenarioHandler:
+@@ -877,11 +1003,14 @@ class ScenarioHandler:
          prompt = FormatOptimizationDiagnosisPrompt(
              error_message=truncated_failure_message,
              diagnosis_context=json.dumps(diagnosis_context, default=str),
@@ -879,7 +966,7 @@ index a30199a..0aa9364 100644
          except Exception as e:
              _log.error(f"unable to parse diagnosis response: {e}")
 diff --git a/backend/app/internal/util.py b/backend/app/internal/util.py
-index 9a3aeb2..2175974 100644
+index 9a3aeb2..0e7b8ad 100644
 --- a/backend/app/internal/util.py
 +++ b/backend/app/internal/util.py
 @@ -1,3 +1,4 @@
@@ -887,7 +974,7 @@ index 9a3aeb2..2175974 100644
  import math
  import time
  import functools
-@@ -405,8 +406,48 @@ def build_map_data_from_json(data_input):
+@@ -405,8 +406,61 @@ def build_map_data_from_json(data_input):
  
      return map_data
  
@@ -919,10 +1006,23 @@ index 9a3aeb2..2175974 100644
 +        return ""
 +    if not isinstance(model_parameters, dict) or not model_parameters:
 +        return ""
-+    feature_flags = ("water_quality", "hydraulics", "desalination_model",
-+                     "infrastructure_timing", "subsurface_risk")
-+    enabled = sorted(name for name in feature_flags
-+                     if str(model_parameters.get(name, "false")).lower() in ("true", "1"))
++
++    def _enabled(name, active_values=None):
++        value = str(model_parameters.get(name, "false")).lower()
++        if active_values is not None:
++            return value in active_values
++        return value not in ("false", "0", "", "none")
++
++    # water_quality/hydraulics are multi-valued in the app ("post_process" runs
++    # the model without requiring those input tables; "discrete"/"co_optimize*"
++    # build them into the optimization).
++    enabled = sorted(name for name, active in (
++        ("water_quality", _enabled("water_quality", ("true", "1", "discrete"))),
++        ("hydraulics", _enabled("hydraulics", ("true", "1", "co_optimize", "co_optimize_linearized"))),
++        ("desalination_model", _enabled("desalination_model")),
++        ("infrastructure_timing", _enabled("infrastructure_timing")),
++        ("subsurface_risk", _enabled("subsurface_risk")),
++    ) if active)
 +    enabled_note = f" Enabled features: {', '.join(enabled)}." if enabled else ""
 +    return (
 +        "Model requirements for the current optimization settings (tailor fills to this configured "
@@ -938,21 +1038,21 @@ index 9a3aeb2..2175974 100644
  
      if data:
          prompt_data = f"Here is the scenario: {data}\n\n"
-@@ -416,13 +457,26 @@ def FormatPrompt(user_prompt, data = None):
+@@ -416,13 +470,26 @@ def FormatPrompt(user_prompt, data = None):
      ## TODO:
      # Some of the input tables operate under a set of rules. For example, some tables can only use values from other tables.
      # If we can define these rules, it should improve how well this works.
 -    dataset_rules = "" # f"Some rules about the dataset:\n"
 +    dataset_rules = ("Dataset rules: only use identifiers (node names, periods, options) that already exist "
 +                     "in the scenario's sets and tables; never delete existing tables or rows.\n")
- 
--    prompt = f"{user_disclosure}{dataset_rules}{prompt_data}Here is the prompt:\n{user_prompt}"
++
 +    units_defaults = _units_defaults_block()
 +    model_requirements = _model_requirements_block(optimization_settings)
 +
 +    reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
 +    reference = f"{reference_docs}\n\n" if reference_docs else ""
-+
+ 
+-    prompt = f"{user_disclosure}{dataset_rules}{prompt_data}Here is the prompt:\n{user_prompt}"
 +    validation = ""
 +    if validation_findings:
 +        validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
@@ -968,7 +1068,7 @@ index 9a3aeb2..2175974 100644
      user_disclosure = (
          "You are diagnosing a failed PARETO optimization run inside a desktop application. "
          "The optimization model comes from the project-pareto Python package and uses the pyomo Python package underneath. "
-@@ -448,7 +502,9 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
+@@ -448,7 +515,9 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
  
      scenario_data = f"Scenario context:\n{scenario}\n\n" if scenario else ""
      diagnosis_data = f"Diagnosis context:\n{diagnosis_context}\n\n" if diagnosis_context else ""
@@ -1243,6 +1343,243 @@ index 0000000..a18e2b2
 +print(f"Built:   {meta.get('built_at')} from {meta.get('docs_dir')}")
 +print(f"Chunks:  {meta.get('chunk_count')} ({meta.get('chunks_per_doc')})")
 +print("Try:  search('pipeline capacity')   show(0)   doc('strategic')")
+diff --git a/backend/tests/test_ai_prompts.py b/backend/tests/test_ai_prompts.py
+new file mode 100644
+index 0000000..f44dde9
+--- /dev/null
++++ b/backend/tests/test_ai_prompts.py
+@@ -0,0 +1,231 @@
++import json
++import unittest
++from unittest import mock
++
++from app.internal import scenario_handler as handler_module
++from app.internal.scenario_handler import sanitize_ai_updated_scenario
++from app.internal.util import FormatPrompt
++
++
++class FormatPromptContractTests(unittest.TestCase):
++    def test_prompt_contains_response_contract(self):
++        prompt = FormatPrompt("fill completions demand", data={"df_parameters": {"PadRates": {}}},
++                              optimization_settings={})
++        for expected in ("'updatedScenario'", "'questions'", "'updateNotes'", "'status'",
++                         "one note per distinct change", "'questions', not in updateNotes",
++                         "Here is the prompt:", "fill completions demand", "PadRates"):
++            self.assertIn(expected, prompt)
++
++    def test_prompt_includes_validation_findings(self):
++        findings = [{"code": "missing_value", "table": "PadRates", "row": ["Pad1"], "severity": "error"}]
++        prompt = FormatPrompt("fix the issues", data={"df_parameters": {}},
++                              optimization_settings={}, validation_findings=findings)
++        self.assertIn("validation findings", prompt)
++        self.assertIn("PadRates", prompt)
++        self.assertIn("Prioritize resolving these", prompt)
++
++    def test_prompt_without_findings_omits_block(self):
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}}, optimization_settings={})
++        self.assertNotIn("validation findings", prompt)
++
++    def test_prompt_includes_units_and_defaults(self):
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}}, optimization_settings={})
++        self.assertIn("Units and defaults", prompt)
++        self.assertIn("bbl", prompt)
++        self.assertIn("not zeros", prompt)
++
++    def test_prompt_includes_model_requirements_from_settings(self):
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
++                              optimization_settings={"waterQuality": "true", "solver": "cbc"})
++        self.assertIn("Model requirements", prompt)
++        self.assertIn("water_quality", prompt)
++        self.assertIn("Enabled features: water_quality", prompt)
++
++    def test_prompt_without_settings_omits_model_requirements(self):
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}})
++        self.assertNotIn("Model requirements", prompt)
++
++    def test_multi_valued_feature_settings_are_parsed_like_the_app(self):
++        # "post_process" runs the model without those input tables; "discrete"
++        # and "co_optimize" build them into the optimization.
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
++                              optimization_settings={"waterQuality": "post_process"})
++        self.assertNotIn("Enabled features: water_quality", prompt)
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
++                              optimization_settings={"waterQuality": "discrete"})
++        self.assertIn("Enabled features: water_quality", prompt)
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
++                              optimization_settings={"hydraulics": "co_optimize"})
++        self.assertIn("Enabled features: hydraulics", prompt)
++        prompt = FormatPrompt("fill demand", data={"df_parameters": {}},
++                              optimization_settings={"hydraulics": "post_process"})
++        self.assertNotIn("Enabled features: hydraulics", prompt)
++
++
++class GenerateDataWithAIQuestionTests(unittest.TestCase):
++    def setUp(self):
++        self.scenario_id = 987654
++        handler_module.scenario_handler.scenario_list[self.scenario_id] = {
++            "id": self.scenario_id,
++            "name": "question test",
++            "optimization": {},
++            "data_input": {"df_sets": {}, "df_parameters": {"PadRates": {"T01": [1]}}},
++        }
++        self.addCleanup(handler_module.scenario_handler.scenario_list.pop, self.scenario_id, None)
++
++    def _run(self, model_answer):
++        with mock.patch.object(handler_module.cborg, "is_available", return_value=True), \
++             mock.patch.object(handler_module.cborg, "clear_history") as clear_mock, \
++             mock.patch.object(handler_module.cborg, "prompt",
++                               return_value=json.dumps(model_answer)) as prompt_mock:
++            result = handler_module.scenario_handler.generate_data_with_ai(self.scenario_id, "fill demand")
++        clear_mock.assert_called_once()
++        self.assertEqual(prompt_mock.call_args.kwargs.get("add_to_history"), False)
++        return result
++
++    def test_valid_questions_pass_through(self):
++        answer = self._run({"status": "success", "updatedScenario": {"df_parameters": {"PadRates": {"T01": [2]}}},
++                            "questions": ["Which unit should demand use?"], "updateNotes": ["updated"]})
++        self.assertEqual(answer["questions"], ["Which unit should demand use?"])
++        self.assertEqual(answer["updatedScenario"]["df_parameters"]["PadRates"], {"T01": [2]})
++
++    def test_malformed_questions_are_dropped(self):
++        answer = self._run({"status": "success", "updatedScenario": {"df_parameters": {}},
++                            "questions": "which unit?", "updateNotes": []})
++        self.assertNotIn("questions", answer)
++
++    def test_questions_survive_markdown_fences(self):
++        fenced = "```json\n" + json.dumps({"status": "success", "updatedScenario": {"df_parameters": {}},
++                                           "updateNotes": [], "questions": ["How many periods?"]}) + "\n```"
++        with mock.patch.object(handler_module.cborg, "is_available", return_value=True), \
++             mock.patch.object(handler_module.cborg, "prompt", return_value=fenced):
++            answer = handler_module.scenario_handler.generate_data_with_ai(self.scenario_id, "fill demand")
++        self.assertEqual(answer["questions"], ["How many periods?"])
++
++    def test_questions_only_response_has_no_updated_scenario(self):
++        answer = self._run({"status": "success", "updateNotes": [], "questions": ["Which pads?"]})
++        self.assertNotIn("updatedScenario", answer)
++        self.assertEqual(answer["questions"], ["Which pads?"])
++
++    def test_string_update_notes_become_a_list(self):
++        result = self._run({"status": "success", "updatedScenario": {"df_parameters": {}},
++                            "updateNotes": "No tables were changed.", "questions": ["Which pads?"]})
++        self.assertEqual(result["updateNotes"][0], "No tables were changed.")
++        self.assertTrue(any("AI guard" in note for note in result["updateNotes"]))
++
++    def test_guard_rejects_unusable_scenario_through_endpoint(self):
++        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [], "questions": []})
++        self.assertEqual(result["status"], "error")
++        self.assertIn("no updates were applied", result["errorMessage"])
++        self.assertNotIn("updatedScenario", result)
++
++    def test_guard_rejection_preserves_valid_questions(self):
++        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
++                            "questions": ["Which pads?", "Which units?"]})
++        self.assertEqual(result["status"], "error")
++        self.assertEqual(result["questions"], ["Which pads?", "Which units?"])
++
++    def test_guard_rejection_drops_malformed_questions(self):
++        result = self._run({"status": "success", "updatedScenario": "garbage", "updateNotes": [],
++                            "questions": ["Which pads?", "   ", 42]})
++        self.assertEqual(result["status"], "error")
++        self.assertNotIn("questions", result)
++
++    def test_guard_notes_are_appended_to_update_notes(self):
++        result = self._run({"status": "success",
++                            "updatedScenario": {"df_sets": {}, "df_parameters": {}},
++                            "updateNotes": ["Only sets were updated."], "questions": []})
++        self.assertEqual(result["updatedScenario"]["df_parameters"]["PadRates"], {"T01": [1]})
++        self.assertIn("Only sets were updated.", result["updateNotes"])
++        self.assertTrue(any("AI guard" in note and "dropped" in note for note in result["updateNotes"]))
++
++
++class SanitizeAiUpdatedScenarioTests(unittest.TestCase):
++    def setUp(self):
++        self.original = {
++            "df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"]},
++            "df_parameters": {
++                "PadRates": {"ProductionPads": ["P1"], "T01": [100]},
++                "CapCost": {"ProductionPads": ["P1"], "VALUE": [10]},
++            },
++        }
++
++    def test_valid_response_passes_through(self):
++        response = {"df_sets": {"ProductionPads": ["P1"]}, "df_parameters": {"PadRates": {"T01": [200]}}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_parameters"]["PadRates"], {"T01": [200]})
++        self.assertEqual(cleaned["df_parameters"]["CapCost"], self.original["df_parameters"]["CapCost"])
++        self.assertTrue(any("dropped" in note and "CapCost" in note for note in notes))
++
++    def test_dropped_tables_are_restored(self):
++        response = {"df_sets": {}, "df_parameters": {"PadRates": {"T01": [200]}}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_parameters"]["CapCost"], self.original["df_parameters"]["CapCost"])
++        self.assertIn("CapCost", notes[0])
++
++    def test_unknown_top_level_keys_are_removed(self):
++        response = {"df_sets": {}, "df_parameters": {}, "surprise_section": {"a": 1}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertNotIn("surprise_section", cleaned)
++        self.assertTrue(any("surprise_section" in note for note in notes))
++
++    def test_malformed_table_entries_revert_to_original(self):
++        response = {"df_parameters": {"PadRates": "not a table", "Extra": [1, 2]}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_parameters"]["PadRates"], self.original["df_parameters"]["PadRates"])
++        self.assertNotIn("Extra", cleaned["df_parameters"])
++        self.assertTrue(any("malformed" in note for note in notes))
++
++    def test_new_tables_are_flagged_not_blocked(self):
++        response = {"df_parameters": {"PadRates": {"T01": [1]}, "NewCost": {"T01": [5]}}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertIn("NewCost", cleaned["df_parameters"])
++        self.assertTrue(any("NewCost" in note and "review" in note for note in notes))
++
++    def test_legacy_data_input_wrapper_is_unwrapped(self):
++        response = {"data_input": {"df_sets": {"ProductionPads": ["P1"]},
++                                   "df_parameters": {"PadRates": {"T01": [200]}}}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertNotIn("data_input", cleaned)
++        self.assertEqual(cleaned["df_parameters"]["PadRates"], {"T01": [200]})
++
++    def test_dropped_set_entries_are_restored(self):
++        response = {"df_sets": {"ProductionPads": ["P1"]}, "df_parameters": {}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
++        self.assertTrue(any("dropped set entries" in note for note in notes))
++
++    def test_malformed_set_entries_are_reverted(self):
++        response = {"df_sets": {"ProductionPads": "oops"}, "df_parameters": {}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_sets"]["ProductionPads"], ["P1"])
++        self.assertTrue(any("malformed set entries" in note for note in notes))
++
++    def test_new_set_entries_are_flagged_not_blocked(self):
++        response = {"df_sets": {"ProductionPads": ["P1"], "StorageSites": ["S1"], "RiverIntakes": ["R1"]},
++                    "df_parameters": {}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_sets"]["RiverIntakes"], ["R1"])
++        self.assertTrue(any("new set entries" in note and "RiverIntakes" in note for note in notes))
++
++    def test_omitted_df_sets_section_is_restored(self):
++        response = {"df_parameters": {"PadRates": {"T01": [200]}}}
++        cleaned, notes = sanitize_ai_updated_scenario(self.original, response)
++        self.assertEqual(cleaned["df_sets"], self.original["df_sets"])
++        self.assertTrue(any("omitted the df_sets section" in note for note in notes))
++
++    def test_original_objects_are_not_aliased(self):
++        response = {"df_parameters": {"PadRates": {"T01": [200]}}}
++        cleaned, _ = sanitize_ai_updated_scenario(self.original, response)
++        cleaned["df_parameters"]["PadRates"]["T01"][0] = 999
++        self.assertEqual(self.original["df_parameters"]["PadRates"]["T01"][0], 100)
++
++    def test_unusable_responses_return_none(self):
++        for bad in ("a string", 42, {"df_sets": {}}, None):
++            cleaned, notes = sanitize_ai_updated_scenario(self.original, bad)
++            self.assertIsNone(cleaned)
++            self.assertTrue(notes and "no updates were applied" in notes[0])
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/backend/tests/test_docs_retrieval.py b/backend/tests/test_docs_retrieval.py
 new file mode 100644
 index 0000000..818147a
@@ -1794,7 +2131,7 @@ index 9cff7d9..f0f871a 100644
        {!loading && !error && result?.valid && result.state !== 'outdated' && <Button onClick={onAdvance} disabled={advancing} variant="contained">Advance to Optimization Setup</Button>}
        <Button onClick={onClose} disabled={loading}>Close</Button>
 diff --git a/electron/ui/src/context/AIPromptContext.tsx b/electron/ui/src/context/AIPromptContext.tsx
-index b2618ed..602dd45 100644
+index b2618ed..dc190d1 100644
 --- a/electron/ui/src/context/AIPromptContext.tsx
 +++ b/electron/ui/src/context/AIPromptContext.tsx
 @@ -22,9 +22,10 @@ export interface AIPromptContextValue {
@@ -1825,7 +2162,7 @@ index b2618ed..602dd45 100644
    ): Promise<void> => {
      if (!isAvailable || requestPending.current) return;
      requestPending.current = true;
-@@ -105,13 +108,14 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -105,22 +108,27 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      setDiagnosis(null);
      setUpdatedScenario(null);
      setUpdateNotes([]);
@@ -1841,7 +2178,12 @@ index b2618ed..602dd45 100644
          if (version !== requestVersion.current) return;
          setResponse(payload);
          if (payload.status === 'error') {
-@@ -121,6 +125,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+           setErrorMessage(payload.errorMessage || payload.error || 'AI request failed.');
++          // The guard can reject an unusable scenario while the response still
++          // carries valid questions; surface them for a follow-up.
++          setQuestions(payload.questions || []);
+           setStatus('error');
+           return;
          }
          setUpdatedScenario(payload.updatedScenario || null);
          setUpdateNotes(payload.updateNotes || []);
@@ -1849,7 +2191,7 @@ index b2618ed..602dd45 100644
        } else {
          const payload = await requestAIOptimizationDiagnosis(port, idNumber, text);
          if (version !== requestVersion.current) return;
-@@ -141,8 +146,8 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -141,8 +149,8 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      }
    };
  
@@ -1860,7 +2202,7 @@ index b2618ed..602dd45 100644
    const runOptimizationDiagnosis = (id: string | number, message: string): Promise<void> =>
      runRequest('optimization-diagnosis', id, message);
  
-@@ -157,6 +162,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -157,6 +165,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      setDiagnosis(null);
      setUpdatedScenario(null);
      setUpdateNotes([]);
@@ -1868,7 +2210,7 @@ index b2618ed..602dd45 100644
      setLastPrompt(null);
    };
  
-@@ -172,6 +178,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -172,6 +181,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
        diagnosis,
        updatedScenario,
        updateNotes,
@@ -1876,7 +2218,7 @@ index b2618ed..602dd45 100644
        errorMessage,
        lastPrompt,
        runPrompt,
-@@ -187,6 +194,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -187,6 +197,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
        diagnosis,
        updatedScenario,
        updateNotes,
@@ -1906,10 +2248,23 @@ index b4f1024..575e7f2 100644
  }
  
 diff --git a/electron/ui/src/services/contracts/ai.ts b/electron/ui/src/services/contracts/ai.ts
-index b72610f..14db596 100644
+index b72610f..a69ad92 100644
 --- a/electron/ui/src/services/contracts/ai.ts
 +++ b/electron/ui/src/services/contracts/ai.ts
-@@ -113,14 +113,20 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
+@@ -102,10 +102,11 @@ const failure = (value: unknown, path: string): AIPromptResponse | null => {
+     error: optional(string),
+     errorMessage: optional(string),
+     detail: optional(string),
++    questions: optional(array(string)),
+   })(value, path);
+   const message = body.errorMessage || body.detail || body.error;
+   if (!message?.trim()) throw new DecodeError(path, 'an AI error message');
+-  return { status: 'error', errorMessage: message };
++  return { status: 'error', errorMessage: message, questions: body.questions };
+ };
+ 
+ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) => {
+@@ -113,14 +114,20 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
    if (error) return error;
    const result = object({
      status: literal('success'),
@@ -1951,10 +2306,10 @@ index 06e381b..a53beba 100644
 +  });
 +});
 diff --git a/electron/ui/src/tests/aiprompt.test.tsx b/electron/ui/src/tests/aiprompt.test.tsx
-index e547280..09f798c 100644
+index e547280..8a10cb1 100644
 --- a/electron/ui/src/tests/aiprompt.test.tsx
 +++ b/electron/ui/src/tests/aiprompt.test.tsx
-@@ -185,3 +185,50 @@ test('malformed diagnosis never reports success and an explicit retry can recove
+@@ -185,3 +185,65 @@ test('malformed diagnosis never reports success and an explicit retry can recove
    expect(context.status).toBe('success');
    expect(context.diagnosis).toEqual(diagnosis);
  });
@@ -1989,6 +2344,21 @@ index e547280..09f798c 100644
 +  expect(screen.getByText('Interpreted the request as filling missing set data.')).toBeVisible();
 +  expect(screen.getByText('df_sets: added ProductionPads [PP01]')).toBeVisible();
 +  expect(screen.getByText('df_sets: added StorageSites [S02]')).toBeVisible();
++});
++
++test('a guard rejection with questions surfaces the questions for a follow-up', async () => {
++  render(<View dialog />);
++  await waitFor(() => expect(context.isAvailable).toBe(true));
++  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill' } });
++  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
++  await act(async () => requests[0].resolve(response({
++    status: 'error',
++    errorMessage: 'The AI response did not include the df_parameters input tables, so no updates were applied.',
++    questions: ['Which pads should demand use?'],
++  })));
++  expect(context.status).toBe('error');
++  expect(context.questions).toEqual(['Which pads should demand use?']);
++  expect(screen.getByRole('button', { name: 'Which pads should demand use?' })).toBeVisible();
 +});
 +
 +test('questions without a patch are surfaced for a follow-up instead of a save preview', async () => {

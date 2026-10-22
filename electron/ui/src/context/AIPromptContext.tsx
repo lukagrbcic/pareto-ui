@@ -120,6 +120,9 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
         setResponse(payload);
         if (payload.status === 'error') {
           setErrorMessage(payload.errorMessage || payload.error || 'AI request failed.');
+          // The guard can reject an unusable scenario while the response still
+          // carries valid questions; surface them for a follow-up.
+          setQuestions(payload.questions || []);
           setStatus('error');
           return;
         }
