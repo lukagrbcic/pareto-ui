@@ -199,12 +199,17 @@ def query_tokens(text, limit=40):
     return tokens[:limit]
 
 
-def _retrieve(query, budget_chars, max_chunks, exclude=()):
+def _retrieve(query, budget_chars, max_chunks, exclude=(), extra_tokens=()):
     """Return [(doc, title, body)] chunks ranked by bm25 within a char budget."""
     connection = _index_connection()
     if connection is None:
         return []
     tokens = query_tokens(query)
+    for term in extra_tokens:
+        for token in query_tokens(term):
+            if token and token not in tokens:
+                tokens.append(token)
+    tokens = tokens[:60]
     if not tokens:
         return []
     match = " OR ".join(f'"{token}"' for token in tokens)
@@ -245,9 +250,79 @@ def _terminology_block():
     return row[0] if row else ""
 
 
+def _metadata_value(connection, key):
+    """One metadata table value from the index, or None when absent."""
+    try:
+        row = connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def _installed_pareto_version():
+    """The installed project-pareto package version, or None when unknown."""
+    try:
+        from importlib.metadata import version
+        return version("project-pareto")
+    except Exception:
+        return None
+
+
+def index_provenance():
+    """(pareto_version, built_at) recorded in the index, or (None, None)."""
+    connection = _index_connection()
+    if connection is None:
+        return None, None
+    return _metadata_value(connection, "pareto_version"), _metadata_value(connection, "built_at")
+
+
+def _reference_header():
+    """Header line naming the docs version, with a mismatch warning when the
+    index was built for a different PARETO version than the installed one."""
+    base = "Reference documentation for the PARETO strategic model"
+    pareto_version, built_at = index_provenance()
+    installed = _installed_pareto_version()
+    parts = []
+    if pareto_version:
+        parts.append(f"grounded in PARETO {pareto_version}")
+        if installed and installed != pareto_version:
+            parts.append(f"WARNING: this documentation was built for PARETO {pareto_version} but the "
+                         f"installed version is {installed}; treat version-specific details as potentially outdated")
+    elif installed:
+        parts.append(f"grounded in PARETO {installed} (the docs index does not record which version it was built from)")
+    if built_at:
+        parts.append(f"docs built {built_at[:10]}")
+    return f"{base} (" + "; ".join(parts) + ")" if parts else base
+
+
+def _settings_query_terms(optimization_settings):
+    """Extra retrieval tokens for model features the user enabled, so chunks
+    for those features surface even when the prompt/failure text omits them."""
+    if not isinstance(optimization_settings, dict):
+        return []
+
+    def enabled(name):
+        value = optimization_settings.get(name, "false")
+        return str(value).lower() not in ("false", "0", "", "none")
+
+    terms = []
+    if enabled("waterQuality"):
+        terms.append("water quality components removal efficiency")
+    if enabled("hydraulics"):
+        terms.append("pipeline hydraulics pump head pressure")
+    if enabled("desalination_model"):
+        terms.append("desalination treatment technologies")
+    if enabled("subsurface_risk"):
+        terms.append("subsurface risk")
+    if enabled("infrastructure_timing"):
+        terms.append("infrastructure expansion timing lead time")
+    return terms
+
+
 def prompt_reference_docs(optimization_settings=None, query=None):
     """Reference docs for AI input filling: always-on terminology plus the
-    chunks the user's prompt makes relevant. Empty string without the index.
+    chunks the user's prompt and enabled model features make relevant. Empty
+    string without the index.
     """
     if _index_connection() is None:
         return ""
@@ -258,15 +333,16 @@ def prompt_reference_docs(optimization_settings=None, query=None):
     retrieved = _retrieve(
         query, _AUTOFILL_RETRIEVAL_BUDGET, max_chunks=8,
         exclude={("strategic", "Terminology")},
+        extra_tokens=_settings_query_terms(optimization_settings),
     )
     blocks.extend((f"[{doc}] {title}", body) for doc, title, body in retrieved)
-    return _render("Reference documentation for the PARETO strategic model", blocks)
+    return _render(_reference_header(), blocks)
 
 
 def diagnosis_reference_docs(optimization_settings=None, query=None):
     """Reference docs for optimization diagnosis: always-on terminology plus
-    chunks retrieved against the failure message. Empty string without the
-    index.
+    chunks retrieved against the failure message and enabled model features.
+    Empty string without the index.
     """
     if _index_connection() is None:
         return ""
@@ -277,6 +353,7 @@ def diagnosis_reference_docs(optimization_settings=None, query=None):
     retrieved = _retrieve(
         query, _DIAGNOSIS_RETRIEVAL_BUDGET, max_chunks=12,
         exclude={("strategic", "Terminology")},
+        extra_tokens=_settings_query_terms(optimization_settings),
     )
     blocks.extend((f"[{doc}] {title}", body) for doc, title, body in retrieved)
-    return _render("Reference documentation for the PARETO strategic model", blocks)
+    return _render(_reference_header(), blocks)

@@ -68,7 +68,14 @@ export default function Bottombar(props) {
     const handleOpenSaveModal = () => setOpenSaveModal(true);
     const handleCloseSaveModal = () => setOpenSaveModal(false);
     const handleCloseRerunModal = () => setOpenRerunModal(false);
-    const handleOpenAIPrompt = () => setOpenAIPrompt(true);
+    const handleOpenAIPrompt = () => {
+      // Ground standalone fills too: attach the latest validation findings when
+      // the dialog was not opened through "Fix with AI".
+      if (!aiValidationFindings && validationResult) {
+        setAiValidationFindings(validationResult);
+      }
+      setOpenAIPrompt(true);
+    };
     const handleCloseAIPrompt = () => { setOpenAIPrompt(false); setAiValidationFindings(null); };
     const handleFixValidationWithAI = (result: ScenarioValidation) => {
       setOpenValidationDialog(false);

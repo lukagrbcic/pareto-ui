@@ -56,6 +56,56 @@ def serialized(method):
             return method(self, *args, **kwargs)
     return wrapped
 
+
+def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
+    """Structural guard for whole-scenario AI responses.
+
+    The AI re-emits the complete scenario, so a careless response can silently
+    drop input tables or invent top-level sections; saving it would corrupt
+    the inputs. This returns (cleaned_scenario, guard_notes), or (None, notes)
+    when the response is unusable. Notes are appended to the AI's updateNotes
+    so the review dialog shows exactly what the guard changed.
+    """
+    notes = []
+    if not isinstance(updated_scenario, dict):
+        return None, ["The AI response was not a valid scenario object, so no updates were applied."]
+    if not isinstance(updated_scenario.get("df_parameters"), dict):
+        return None, ["The AI response did not include the df_parameters input tables, so no updates were applied."]
+    cleaned = deepcopy(updated_scenario)
+    original = original_data_input if isinstance(original_data_input, dict) else {}
+    original_params = original.get("df_parameters") or {}
+    params = cleaned["df_parameters"]
+
+    restored = sorted(table for table in original_params if table not in params)
+    for table in restored:
+        params[table] = deepcopy(original_params[table])
+    if restored:
+        notes.append("AI guard: the response dropped " + ", ".join(restored)
+                     + "; the original table(s) were kept.")
+
+    malformed = sorted(table for table, value in params.items() if not isinstance(value, dict))
+    for table in malformed:
+        if table in original_params:
+            params[table] = deepcopy(original_params[table])
+        else:
+            params.pop(table, None)
+    if malformed:
+        notes.append("AI guard: replaced malformed entries with original values for " + ", ".join(malformed) + ".")
+
+    added = sorted(table for table in params if table not in original_params)
+    if added:
+        notes.append("AI guard: the response added new table(s) " + ", ".join(added)
+                     + "; review them before saving.")
+
+    allowed_keys = set(original) | {"df_sets", "df_parameters"}
+    removed = sorted(key for key in cleaned if key not in allowed_keys)
+    for key in removed:
+        cleaned.pop(key, None)
+    if removed:
+        notes.append("AI guard: removed unrecognized scenario section(s) " + ", ".join(removed) + ".")
+    return cleaned, notes
+
+
 class ScenarioHandler:
     """Manage the saved scenarios."""
 
@@ -788,15 +838,18 @@ class ScenarioHandler:
             prompt = FormatPrompt(user_prompt=user_prompt, data=data_input, optimization_settings=scenario.get("optimization"), validation_findings=validation_findings)
             # _log.info(f"full prompt: {prompt}")
             _log.info(f"hitting cborg now")
-            resp = cborg.prompt(prompt)
+            # Each request is self-contained: never replay or accumulate shared
+            # client history (token growth and cross-scenario context leakage).
+            cborg.clear_history()
+            resp = cborg.prompt(prompt, add_to_history=False)
             _log.info(f"resp: {resp}")
             answer = self._parse_ai_json_response(resp)
 
-            ## TODO: 
+            ## TODO:
             ## 1) check if the prompt response was good (resp.status)
             ## 2) If ok, update scenario in DB
             ## 3) We must also update the map data (need function for this) and excel sheet
-            ## 4) Optionally, we could display the updates to the user 
+            ## 4) Optionally, we could display the updates to the user
 
             ## sample prompt: Can you fill in completions demand with 10000 barrels in each time period
 
@@ -805,8 +858,15 @@ class ScenarioHandler:
             if status == "error":
                 _log.info(f"error response from AI: {answer.get('errorMessage')}")
                 return answer
-            
+
+            guard_notes = []
             updatedScenario = answer.get("updatedScenario")
+            if updatedScenario is not None:
+                cleaned_scenario, guard_notes = sanitize_ai_updated_scenario(data_input, updatedScenario)
+                if cleaned_scenario is None:
+                    _log.info(f"AI response failed the structural guard: {guard_notes[0]}")
+                    return {"status": "error", "errorMessage": guard_notes[0]}
+                answer["updatedScenario"] = cleaned_scenario
             notes = answer.get("updateNotes")
             if isinstance(notes, str):
                 answer["updateNotes"] = [notes] if notes.strip() else []
@@ -819,6 +879,8 @@ class ScenarioHandler:
             elif notes is not None:
                 _log.info(f"dropping malformed AI updateNotes: {notes!r}")
                 answer.pop("updateNotes", None)
+            if guard_notes:
+                answer["updateNotes"] = (answer.get("updateNotes") or []) + guard_notes
             questions = answer.get("questions")
             if questions is not None:
                 if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
@@ -901,7 +963,9 @@ class ScenarioHandler:
         _log.info("hitting cborg for optimization diagnosis")
 
         try:
-            resp = cborg.prompt(prompt)
+            # Self-contained request, like the autofill path.
+            cborg.clear_history()
+            resp = cborg.prompt(prompt, add_to_history=False)
             answer = self._parse_ai_json_response(resp)
         except Exception as e:
             _log.error(f"unable to parse diagnosis response: {e}")

@@ -21,6 +21,10 @@ class AIConfiguration:
     def is_available(self):
         return self.active_client.is_available()
 
+    def clear_history(self):
+        """Reset the active client's conversation history."""
+        self.active_client.clear_history()
+
     def describe(self):
         client = self.active_client
         return {

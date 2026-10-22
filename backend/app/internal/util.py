@@ -1,3 +1,4 @@
+import json
 import math
 import time
 import functools
@@ -405,6 +406,44 @@ def build_map_data_from_json(data_input):
 
     return map_data
 
+def _units_defaults_block():
+    """Units and blank-cell conventions for the scenario inputs."""
+    return (
+        "Units and defaults: the scenario's display units are "
+        f"{json.dumps(DEFAULT_UNITS)}. Blank cells mean an input was never filled; they are not zeros, "
+        "so never fill a blank with 0 unless the documented default for that table is actually 0. "
+        "When you add or change values, state the units you assumed in updateNotes.\n"
+    )
+
+
+def _model_requirements_block(optimization_settings):
+    """The effective model parameters implied by the user's optimization settings.
+
+    Fills must be tailored to the configured model: features that are enabled
+    (water quality, hydraulics, desalination, ...) make their input tables
+    required, and objective/solver choices shape what values make sense.
+    """
+    if not optimization_settings:
+        return ""
+    try:
+        model_parameters = prepare_config({"optimization": optimization_settings},
+                                          expected_response="modelParameters")
+    except Exception:
+        return ""
+    if not isinstance(model_parameters, dict) or not model_parameters:
+        return ""
+    feature_flags = ("water_quality", "hydraulics", "desalination_model",
+                     "infrastructure_timing", "subsurface_risk")
+    enabled = sorted(name for name in feature_flags
+                     if str(model_parameters.get(name, "false")).lower() in ("true", "1"))
+    enabled_note = f" Enabled features: {', '.join(enabled)}." if enabled else ""
+    return (
+        "Model requirements for the current optimization settings (tailor fills to this configured "
+        f"model; tables required only under an enabled feature are required here too): "
+        f"{json.dumps(model_parameters)}.{enabled_note}\n"
+    )
+
+
 def FormatPrompt(user_prompt, data = None, optimization_settings = None, validation_findings = None):
     from app.internal.ai.docs import prompt_reference_docs
 
@@ -418,7 +457,11 @@ def FormatPrompt(user_prompt, data = None, optimization_settings = None, validat
     ## TODO:
     # Some of the input tables operate under a set of rules. For example, some tables can only use values from other tables.
     # If we can define these rules, it should improve how well this works.
-    dataset_rules = "" # f"Some rules about the dataset:\n"
+    dataset_rules = ("Dataset rules: only use identifiers (node names, periods, options) that already exist "
+                     "in the scenario's sets and tables; never delete existing tables or rows.\n")
+
+    units_defaults = _units_defaults_block()
+    model_requirements = _model_requirements_block(optimization_settings)
 
     reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
     reference = f"{reference_docs}\n\n" if reference_docs else ""
@@ -427,7 +470,7 @@ def FormatPrompt(user_prompt, data = None, optimization_settings = None, validat
     if validation_findings:
         validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
 
-    prompt = f"{user_disclosure}{reference}{dataset_rules}{validation}{prompt_data}Here is the prompt:\n{user_prompt}"
+    prompt = f"{user_disclosure}{reference}{model_requirements}{dataset_rules}{units_defaults}{validation}{prompt_data}Here is the prompt:\n{user_prompt}"
 
     return prompt
 

@@ -3,11 +3,12 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from app.internal.ai import docs
 
 
-def _build_index(path, rows):
+def _build_index(path, rows, metadata=None):
     connection = sqlite3.connect(path)
     try:
         connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -17,6 +18,10 @@ def _build_index(path, rows):
         connection.executemany(
             "INSERT INTO chunks (doc, title, body) VALUES (?, ?, ?)", rows
         )
+        if metadata:
+            connection.executemany(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)", metadata.items()
+            )
         connection.commit()
     finally:
         connection.close()
@@ -38,6 +43,11 @@ class DocsRetrievalTests(unittest.TestCase):
         ])
         self._previous = os.environ.get("PARETO_DOCS_INDEX")
         os.environ["PARETO_DOCS_INDEX"] = str(self.index_path)
+
+    def _rebuild_index(self, rows, metadata=None):
+        os.remove(self.index_path)
+        _build_index(self.index_path, rows, metadata)
+        docs._index_connections.clear()
 
     def tearDown(self):
         if self._previous is None:
@@ -71,9 +81,8 @@ class DocsRetrievalTests(unittest.TestCase):
         self.assertNotIn("Pipeline capacity constraints", result)
 
     def test_diagnostics_budget_limits_total_size(self):
-        os.remove(self.index_path)
         big_body = "pipeline capacity " + ("filler sentence about capacity. " * 400)
-        _build_index(self.index_path, [
+        self._rebuild_index([
             ("strategic", f"Big section (part {part})", big_body) for part in range(1, 21)
         ] + [("strategic", "Terminology", "terminology body")])
         result = docs.diagnosis_reference_docs({}, "pipeline capacity")
@@ -83,6 +92,44 @@ class DocsRetrievalTests(unittest.TestCase):
         os.environ["PARETO_DOCS_INDEX"] = str(Path(self._tmp.name) / "missing.sqlite")
         self.assertEqual(docs.prompt_reference_docs({}, "anything"), "")
         self.assertEqual(docs.diagnosis_reference_docs({}, "anything"), "")
+
+    def test_enabled_feature_settings_bias_retrieval(self):
+        self._rebuild_index([
+            ("strategic", "Terminology", "terminology body"),
+            ("water_treatment", "Water Quality Components",
+             "Water quality components define concentration limits that reuse must satisfy."),
+        ])
+        plain = docs.prompt_reference_docs({}, "fill the demand inputs")
+        self.assertNotIn("Water Quality Components", plain)
+        biased = docs.prompt_reference_docs({"waterQuality": "true"}, "fill the demand inputs")
+        self.assertIn("Water Quality Components", biased)
+
+    def test_header_records_docs_version_and_warns_on_mismatch(self):
+        self._rebuild_index([
+            ("strategic", "Terminology", "terminology body"),
+        ], metadata={"pareto_version": "1.0.0", "built_at": "2026-01-15T00:00:00Z"})
+        with mock.patch.object(docs, "_installed_pareto_version", return_value="9.9.9"):
+            result = docs.prompt_reference_docs({}, "fill demand")
+        self.assertIn("grounded in PARETO 1.0.0", result)
+        self.assertIn("WARNING", result)
+        self.assertIn("9.9.9", result)
+        self.assertIn("docs built 2026-01-15", result)
+
+    def test_header_has_no_warning_when_versions_match(self):
+        self._rebuild_index([
+            ("strategic", "Terminology", "terminology body"),
+        ], metadata={"pareto_version": "1.2.dev0"})
+        with mock.patch.object(docs, "_installed_pareto_version", return_value="1.2.dev0"):
+            result = docs.prompt_reference_docs({}, "fill demand")
+        self.assertIn("grounded in PARETO 1.2.dev0", result)
+        self.assertNotIn("WARNING", result)
+
+    def test_header_falls_back_to_installed_version_without_metadata(self):
+        with mock.patch.object(docs, "_installed_pareto_version", return_value="1.2.dev0"):
+            result = docs.prompt_reference_docs({}, "fill demand")
+        self.assertIn("does not record", result)
+        self.assertIn("1.2.dev0", result)
+        self.assertNotIn("WARNING", result)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,15 @@ def _check_fts5(connection):
         sys.exit(f"SQLite FTS5 is not available in this environment: {error}")
 
 
+def _pareto_version():
+    """The installed project-pareto version the docs are grounded against."""
+    try:
+        from importlib.metadata import version
+        return version("project-pareto")
+    except Exception:
+        return "unknown"
+
+
 def build_index(docs_dir, output, max_chunk_chars):
     if not docs_dir.is_dir():
         sys.exit(f"Docs snapshot not found: {docs_dir}")
@@ -98,6 +107,7 @@ def build_index(docs_dir, output, max_chunk_chars):
 
         metadata = {
             "index_version": "1",
+            "pareto_version": _pareto_version(),
             "built_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "docs_dir": str(docs_dir),
             "max_chunk_chars": max_chunk_chars,
