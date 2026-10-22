@@ -119,11 +119,16 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
   const [promptError, setPromptError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"notes" | "diff">("notes");
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+  const [answers, setAnswers] = useState<Record<string, string>>({});
   const aiDataInput = updatedScenario;
 
   useEffect(() => {
     setExpandedTables(new Set());
   }, [updatedScenario]);
+
+  useEffect(() => {
+    setAnswers({});
+  }, [questions]);
 
   const statusLabel = useMemo(() => {
     if (status === "running") return "Running";
@@ -132,18 +137,25 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
     return "Ready";
   }, [status]);
 
+  const questionTranscript = useMemo(() => {
+    const answered = questions
+      .map((question) => ({ question, answer: (answers[question] || "").trim() }))
+      .filter(({ answer }) => answer.length > 0);
+    if (!answered.length) return "";
+    return `Answers to your previous questions:\n${answered
+      .map(({ question, answer }) => `Q: ${question}\nA: ${answer}`)
+      .join("\n")}`;
+  }, [answers, questions]);
+
   const handleSubmit = async (): Promise<void> => {
     const trimmed = prompt.trim();
-    if (!trimmed || scenarioId == null) {
+    if ((!trimmed && !questionTranscript) || scenarioId == null) {
       setPromptError("Please add a prompt first.");
       return;
     }
     setPromptError(null);
-    await runPrompt(scenarioId, trimmed, validationFindings);
-  };
-
-  const handleQuestionClick = (question: string): void => {
-    setPrompt((current) => (current.trim() ? `${current.trim()}\n${question}` : question));
+    const outgoing = [trimmed, questionTranscript].filter(Boolean).join("\n\n");
+    await runPrompt(scenarioId, outgoing, validationFindings);
   };
 
   const handleSaveUpdates = async (): Promise<void> => {
@@ -176,6 +188,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
     setPrompt("");
     setPromptError(null);
     setViewMode("notes");
+    setAnswers({});
   };
 
   const handleClose = (): void => {
@@ -357,20 +370,30 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
         )}
         {questions.length > 0 && (
           <Box sx={{ mt: 2, p: 2, borderRadius: 2, bgcolor: "rgba(237, 108, 2, 0.08)", border: "1px solid rgba(237, 108, 2, 0.35)" }}>
-            <Typography variant="subtitle2" sx={{ mb: 1 }}>
-              The assistant needs more information before it can proceed. Click a question to answer it:
+            <Typography variant="subtitle2">
+              The assistant needs more information before it can proceed. Type your answers below,
+              then run AI Fill again; leave a field blank to skip that question.
             </Typography>
-            <Stack spacing={0.5}>
+            <Stack spacing={1.5} sx={{ mt: 1.5 }}>
               {questions.map((question) => (
-                <Button
-                  key={question}
-                  onClick={() => handleQuestionClick(question)}
-                  variant="text"
-                  color="inherit"
-                  sx={{ justifyContent: "flex-start", textTransform: "none", px: 1, py: 0.25, textAlign: "left" }}
-                >
-                  {question}
-                </Button>
+                <Box key={question}>
+                  <Typography variant="body2" sx={{ mb: 0.5, fontWeight: 500 }}>
+                    {question}
+                  </Typography>
+                  <TextField
+                    size="small"
+                    fullWidth
+                    multiline
+                    minRows={1}
+                    placeholder="Type your answer…"
+                    value={answers[question] || ""}
+                    onChange={(event) =>
+                      setAnswers((current) => ({ ...current, [question]: event.target.value }))
+                    }
+                    inputProps={{ "aria-label": `Answer to: ${question}` }}
+                    disabled={isRunning}
+                  />
+                </Box>
               ))}
             </Stack>
           </Box>

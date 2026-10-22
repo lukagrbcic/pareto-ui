@@ -230,20 +230,35 @@ test('a guard rejection with questions surfaces the questions for a follow-up', 
   })));
   expect(context.status).toBe('error');
   expect(context.questions).toEqual(['Which pads should demand use?']);
-  expect(screen.getByRole('button', { name: 'Which pads should demand use?' })).toBeVisible();
+  expect(screen.getByLabelText('Answer to: Which pads should demand use?')).toBeVisible();
 });
 
-test('questions without a patch are surfaced for a follow-up instead of a save preview', async () => {
+test('questions are answered inline and sent as a Q/A transcript on the next run', async () => {
   render(<View dialog />);
   await waitFor(() => expect(context.isAvailable).toBe(true));
   fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill demand' } });
   fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
   await act(async () => requests[0].resolve(response({
-    status: 'success', updateNotes: [], questions: ['Which unit should demand use?'],
+    status: 'success', updateNotes: [],
+    questions: ['Which unit should demand use?', 'Which solver should the scenario use?'],
   })));
-  expect(context.questions).toEqual(['Which unit should demand use?']);
+  expect(context.questions).toEqual(['Which unit should demand use?', 'Which solver should the scenario use?']);
   expect(context.status).toBe('success');
   expect(screen.queryByRole('button', { name: 'Save Updates' })).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button', { name: 'Which unit should demand use?' }));
-  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toContain('Which unit should demand use?');
+  fireEvent.change(screen.getByLabelText('Answer to: Which unit should demand use?'),
+    { target: { value: 'Unit W1' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
+  expect(requests).toHaveLength(2);
+  const followUp = (global.fetch as jest.Mock).mock.calls
+    .filter((call) => call[1] && typeof call[1].body === 'string')
+    .map((call) => JSON.parse(call[1].body))
+    .filter((parsed) => typeof parsed.prompt === 'string'
+      && parsed.prompt.includes('Answers to your previous questions:'));
+  expect(followUp).toHaveLength(1);
+  expect(followUp[0].prompt).toContain('Fill demand');
+  expect(followUp[0].prompt).toContain('Q: Which unit should demand use?');
+  expect(followUp[0].prompt).toContain('A: Unit W1');
+  expect(followUp[0].prompt).not.toContain('Which solver');
+  await act(async () => requests[1].resolve(response({ status: 'success', updateNotes: [], questions: [] })));
+  expect(context.status).toBe('success');
 });

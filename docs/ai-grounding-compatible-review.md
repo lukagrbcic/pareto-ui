@@ -102,8 +102,9 @@ scannable bullets.
 - `services/contracts/ai.ts`: `updatedScenario` becomes optional; a success response must carry
   updates **or** questions; tolerates the legacy `updatedNotes` spelling.
 - `AIPromptContext.tsx`: questions state; `runPrompt(id, prompt, validationFindings?)`.
-- `AIPromptDialog.tsx`: questions render as clickable buttons that append the question text to the
-  prompt box for a follow-up run; questions-only responses suppress the Save button.
+- `AIPromptDialog.tsx`: questions render with **inline answer fields** (replaced the original
+  port's click-to-append behavior — see Part 2.5 item 5); questions-only responses suppress the
+  Save button.
 - `app.service.ts`: sends `validation_findings` in the POST body when present.
 
 ### 1.7 Validation findings + auto re-validation — `Bottombar.tsx`, `ScenarioValidationDialog.tsx`
@@ -245,8 +246,10 @@ Backend (`tests/test_ai_prompts.py`, `tests/test_docs_retrieval.py`):
 Frontend (`tests/bottombar.test.tsx`, `tests/aiprompt.test.tsx`):
 - New test: validate → close dialog → "AI Fill Inputs" → the AI dialog receives
   `validationFindings` matching the validation result. The dialog mock now captures props.
-- New test: an error response carrying `questions` (guard rejection) surfaces them as clickable
-  follow-ups.
+- New test: an error response carrying `questions` (guard rejection) surfaces them with answer
+  fields.
+- New test: answering questions inline sends a `Q:/A:` transcript on the follow-up run, includes
+  the original prompt, and omits unanswered questions.
 
 **Verification:** 38 AI tests + 47 backend suites + 258 frontend tests pass; `tsc --noEmit` clean.
 
@@ -271,7 +274,25 @@ A follow-up review of the whole branch found and fixed four issues:
 4. **Guard rejections discarded questions** (`scenario_handler.py`, `contracts/ai.ts`,
    `AIPromptContext.tsx`) — when the guard rejects an unusable scenario, valid `questions` from
    the same response are now preserved on the error, the decoder carries them, and the dialog
-   renders them as clickable follow-ups.
+   surfaces them for follow-up answers.
+5. **Questions became inline answer fields** (`AIPromptDialog.tsx`) — the port's questions panel
+   rendered each question as a clickable button that appended the question text into the prompt
+   box. That was ambiguous: nothing indicated the user should type an answer beside it, and
+   because AI calls are stateless the model never saw its own question, so a click-then-run just
+   echoed the question back and wasted a round trip. The panel now renders each question with a
+   text field; running the fill assembles a self-describing transcript into the outgoing prompt:
+
+   ```
+   <your original prompt>
+
+   Answers to your previous questions:
+   Q: Which unit should demand use?
+   A: Unit W1
+   ```
+
+   Unanswered questions are omitted; answers-only (empty prompt box) is allowed; fields are
+   disabled while a request runs and reset when new questions arrive or the prompt is cleared.
+   The backend contract is unchanged — the transcript is ordinary prompt text.
 
 ---
 
@@ -1723,7 +1744,7 @@ index 0000000..818147a
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx b/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
-index ce2d02a..856c637 100644
+index ce2d02a..a5c518c 100644
 --- a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
 +++ b/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
 @@ -1,5 +1,6 @@
@@ -1734,7 +1755,7 @@ index ce2d02a..856c637 100644
    Box,
    Button,
    Chip,
-@@ -23,24 +24,107 @@ interface AIPromptDialogProps {
+@@ -23,24 +24,112 @@ interface AIPromptDialogProps {
    onClose: () => void;
    scenarioId: string | number | null | undefined;
    scenarioName?: string;
@@ -1835,25 +1856,45 @@ index ce2d02a..856c637 100644
    const [promptError, setPromptError] = useState<string | null>(null);
    const [viewMode, setViewMode] = useState<"notes" | "diff">("notes");
 +  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
++  const [answers, setAnswers] = useState<Record<string, string>>({});
    const aiDataInput = updatedScenario;
  
 +  useEffect(() => {
 +    setExpandedTables(new Set());
 +  }, [updatedScenario]);
 +
++  useEffect(() => {
++    setAnswers({});
++  }, [questions]);
++
    const statusLabel = useMemo(() => {
      if (status === "running") return "Running";
      if (status === "success") return "Completed";
-@@ -55,10 +139,14 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -48,17 +137,28 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+     return "Ready";
+   }, [status]);
+ 
++  const questionTranscript = useMemo(() => {
++    const answered = questions
++      .map((question) => ({ question, answer: (answers[question] || "").trim() }))
++      .filter(({ answer }) => answer.length > 0);
++    if (!answered.length) return "";
++    return `Answers to your previous questions:\n${answered
++      .map(({ question, answer }) => `Q: ${question}\nA: ${answer}`)
++      .join("\n")}`;
++  }, [answers, questions]);
++
+   const handleSubmit = async (): Promise<void> => {
+     const trimmed = prompt.trim();
+-    if (!trimmed || scenarioId == null) {
++    if ((!trimmed && !questionTranscript) || scenarioId == null) {
+       setPromptError("Please add a prompt first.");
        return;
      }
      setPromptError(null);
 -    await runPrompt(scenarioId, trimmed);
-+    await runPrompt(scenarioId, trimmed, validationFindings);
-+  };
-+
-+  const handleQuestionClick = (question: string): void => {
-+    setPrompt((current) => (current.trim() ? `${current.trim()}\n${question}` : question));
++    const outgoing = [trimmed, questionTranscript].filter(Boolean).join("\n\n");
++    await runPrompt(scenarioId, outgoing, validationFindings);
    };
  
 -  const handleSaveUpdates = (): void => {
@@ -1861,7 +1902,7 @@ index ce2d02a..856c637 100644
      if (!scenarioData || !updatedScenario) return;
      const mergedScenario = {
        ...scenarioData,
-@@ -67,7 +155,20 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -67,7 +167,20 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          ...aiDataInput,
        },
      };
@@ -1883,7 +1924,15 @@ index ce2d02a..856c637 100644
    };
  
    const handleClearPrompt = (): void => {
-@@ -88,7 +189,16 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -75,6 +188,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+     setPrompt("");
+     setPromptError(null);
+     setViewMode("notes");
++    setAnswers({});
+   };
+ 
+   const handleClose = (): void => {
+@@ -88,7 +202,16 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
        note
          .replace(/df_parameters\[['"]([^'"]+)['"]\]/g, "$1")
          .replace(/df_parameters\./g, "");
@@ -1901,7 +1950,7 @@ index ce2d02a..856c637 100644
    }, [updateNotes]);
    const diffTables = useMemo(() => {
      if (!scenarioData || !aiDataInput) return [];
-@@ -100,7 +210,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -100,7 +223,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
        columns: string[];
        rows: Array<{ index: number; cells: any[]; changed: boolean[] }>;
        totalChangedRows: number;
@@ -1909,7 +1958,7 @@ index ce2d02a..856c637 100644
        nonTabular: boolean;
      }> = [];
  
-@@ -131,7 +240,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -131,7 +253,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
            columns: [],
            rows: [],
            totalChangedRows: 0,
@@ -1917,7 +1966,7 @@ index ce2d02a..856c637 100644
            nonTabular: true,
          });
          return;
-@@ -171,17 +279,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -171,17 +292,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          }
        }
  
@@ -1937,7 +1986,7 @@ index ce2d02a..856c637 100644
          nonTabular: false,
        });
      });
-@@ -194,7 +296,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -194,7 +309,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
        open={open}
        onClose={handleClose}
        fullWidth
@@ -1946,7 +1995,7 @@ index ce2d02a..856c637 100644
        PaperProps={{
          sx: {
            borderRadius: 3,
-@@ -223,6 +325,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -223,6 +338,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          </Stack>
        </DialogTitle>
        <DialogContent sx={{ pt: 1 }}>
@@ -1958,26 +2007,36 @@ index ce2d02a..856c637 100644
          <TextField
            value={prompt}
            onChange={(event) => setPrompt(event.target.value)}
-@@ -248,6 +355,26 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -248,6 +368,36 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
              {errorMessage}
            </Typography>
          )}
 +        {questions.length > 0 && (
 +          <Box sx={{ mt: 2, p: 2, borderRadius: 2, bgcolor: "rgba(237, 108, 2, 0.08)", border: "1px solid rgba(237, 108, 2, 0.35)" }}>
-+            <Typography variant="subtitle2" sx={{ mb: 1 }}>
-+              The assistant needs more information before it can proceed. Click a question to answer it:
++            <Typography variant="subtitle2">
++              The assistant needs more information before it can proceed. Type your answers below,
++              then run AI Fill again; leave a field blank to skip that question.
 +            </Typography>
-+            <Stack spacing={0.5}>
++            <Stack spacing={1.5} sx={{ mt: 1.5 }}>
 +              {questions.map((question) => (
-+                <Button
-+                  key={question}
-+                  onClick={() => handleQuestionClick(question)}
-+                  variant="text"
-+                  color="inherit"
-+                  sx={{ justifyContent: "flex-start", textTransform: "none", px: 1, py: 0.25, textAlign: "left" }}
-+                >
-+                  {question}
-+                </Button>
++                <Box key={question}>
++                  <Typography variant="body2" sx={{ mb: 0.5, fontWeight: 500 }}>
++                    {question}
++                  </Typography>
++                  <TextField
++                    size="small"
++                    fullWidth
++                    multiline
++                    minRows={1}
++                    placeholder="Type your answer…"
++                    value={answers[question] || ""}
++                    onChange={(event) =>
++                      setAnswers((current) => ({ ...current, [question]: event.target.value }))
++                    }
++                    inputProps={{ "aria-label": `Answer to: ${question}` }}
++                    disabled={isRunning}
++                  />
++                </Box>
 +              ))}
 +            </Stack>
 +          </Box>
@@ -1985,7 +2044,7 @@ index ce2d02a..856c637 100644
          {showSuccessPanel && (
            <Box sx={{ mt: 3, p: 2, borderRadius: 2, bgcolor: "rgba(1, 103, 143, 0.08)" }}>
              <Tabs
-@@ -299,56 +426,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -299,56 +449,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
                          </Typography>
                        </Box>
                      ) : (
@@ -2306,10 +2365,10 @@ index 06e381b..a53beba 100644
 +  });
 +});
 diff --git a/electron/ui/src/tests/aiprompt.test.tsx b/electron/ui/src/tests/aiprompt.test.tsx
-index e547280..8a10cb1 100644
+index e547280..2e2555e 100644
 --- a/electron/ui/src/tests/aiprompt.test.tsx
 +++ b/electron/ui/src/tests/aiprompt.test.tsx
-@@ -185,3 +185,65 @@ test('malformed diagnosis never reports success and an explicit retry can recove
+@@ -185,3 +185,80 @@ test('malformed diagnosis never reports success and an explicit retry can recove
    expect(context.status).toBe('success');
    expect(context.diagnosis).toEqual(diagnosis);
  });
@@ -2358,22 +2417,37 @@ index e547280..8a10cb1 100644
 +  })));
 +  expect(context.status).toBe('error');
 +  expect(context.questions).toEqual(['Which pads should demand use?']);
-+  expect(screen.getByRole('button', { name: 'Which pads should demand use?' })).toBeVisible();
++  expect(screen.getByLabelText('Answer to: Which pads should demand use?')).toBeVisible();
 +});
 +
-+test('questions without a patch are surfaced for a follow-up instead of a save preview', async () => {
++test('questions are answered inline and sent as a Q/A transcript on the next run', async () => {
 +  render(<View dialog />);
 +  await waitFor(() => expect(context.isAvailable).toBe(true));
 +  fireEvent.change(screen.getByRole('textbox'), { target: { value: 'Fill demand' } });
 +  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
 +  await act(async () => requests[0].resolve(response({
-+    status: 'success', updateNotes: [], questions: ['Which unit should demand use?'],
++    status: 'success', updateNotes: [],
++    questions: ['Which unit should demand use?', 'Which solver should the scenario use?'],
 +  })));
-+  expect(context.questions).toEqual(['Which unit should demand use?']);
++  expect(context.questions).toEqual(['Which unit should demand use?', 'Which solver should the scenario use?']);
 +  expect(context.status).toBe('success');
 +  expect(screen.queryByRole('button', { name: 'Save Updates' })).not.toBeInTheDocument();
-+  fireEvent.click(screen.getByRole('button', { name: 'Which unit should demand use?' }));
-+  expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toContain('Which unit should demand use?');
++  fireEvent.change(screen.getByLabelText('Answer to: Which unit should demand use?'),
++    { target: { value: 'Unit W1' } });
++  fireEvent.click(screen.getByRole('button', { name: 'Run AI Fill' }));
++  expect(requests).toHaveLength(2);
++  const followUp = (global.fetch as jest.Mock).mock.calls
++    .filter((call) => call[1] && typeof call[1].body === 'string')
++    .map((call) => JSON.parse(call[1].body))
++    .filter((parsed) => typeof parsed.prompt === 'string'
++      && parsed.prompt.includes('Answers to your previous questions:'));
++  expect(followUp).toHaveLength(1);
++  expect(followUp[0].prompt).toContain('Fill demand');
++  expect(followUp[0].prompt).toContain('Q: Which unit should demand use?');
++  expect(followUp[0].prompt).toContain('A: Unit W1');
++  expect(followUp[0].prompt).not.toContain('Which solver');
++  await act(async () => requests[1].resolve(response({ status: 'success', updateNotes: [], questions: [] })));
++  expect(context.status).toBe('success');
 +});
 diff --git a/electron/ui/src/tests/bottombar.test.tsx b/electron/ui/src/tests/bottombar.test.tsx
 index eb3eda0..10a9ec7 100644
