@@ -120,7 +120,9 @@ jobs:
           - os: linux
             os-version: ubuntu-22.04
           - os: win64
-            os-version: windows-latest
+            # windows-latest images since 20261021 crash-loop the GPU process
+            # of every Chromium browser at startup; windows-2022 is unaffected.
+            os-version: windows-2022
     env:
       CI: "true"
       BROWSER: none
