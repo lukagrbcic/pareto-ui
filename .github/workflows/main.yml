@@ -163,6 +163,11 @@ jobs:
       - name: Cypress e2e tests
         working-directory: electron/ui
         timeout-minutes: 24
+        env:
+          # Windows runners crash Electron's GPU process with an access
+          # violation (0xC0000005) before any test runs. Force software
+          # rendering so the bundled Electron stays stable headless.
+          ELECTRON_EXTRA_LAUNCH_ARGS: --disable-gpu
         run: |
           npx cypress run
       - name: Upload Cypress artifacts and server logs
