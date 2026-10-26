@@ -162,6 +162,14 @@ jobs:
             http-get://127.0.0.1:50011/get_project_name \
             http-get://127.0.0.1:3000
 
+      - name: Print backend and frontend logs on startup failure
+        if: failure()
+        run: |
+          echo "=== pareto-backend.log ==="
+          cat "$RUNNER_TEMP/pareto-backend.log" || true
+          echo "=== pareto-frontend.log ==="
+          cat "$RUNNER_TEMP/pareto-frontend.log" || true
+
       - name: Cypress e2e tests
         working-directory: electron/ui
         timeout-minutes: 24
