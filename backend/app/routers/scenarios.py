@@ -542,6 +542,8 @@ async def request_ai_data_update(request: Request, id: int) -> dict:
     """
     req = await request.json()
     prompt = req.get("prompt", None)
+    # Optional validation evidence from the UI ("Fix with AI" or the last
+    # validation run); embedded into the prompt so the fill targets real issues.
     validation_findings = req.get("validation_findings", None)
     if validation_findings is not None and not isinstance(validation_findings, (list, dict)):
         raise HTTPException(400, detail="validation_findings must be a list or object.")

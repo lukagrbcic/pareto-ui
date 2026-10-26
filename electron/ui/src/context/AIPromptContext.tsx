@@ -61,6 +61,9 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
   const [updatedScenario, setUpdatedScenario] = useState<AIPromptUpdatedScenario | null>(null);
   const [updateNotes, setUpdateNotes] = useState<string[]>([]);
   const [questions, setQuestions] = useState<string[]>([]);
+  // The assistant's follow-up questions from the latest fill response. Rendered
+  // with inline answer fields in the dialog; cleared on new runs (see runRequest)
+  // so stale questions never mix with a fresh response.
   const [lastPrompt, setLastPrompt] = useState<string | null>(null);
 
   useEffect(() => {
@@ -149,6 +152,8 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
     }
   };
 
+  // validationFindings: optional validation evidence (from "Fix with AI" or the
+  // last validation run) forwarded into the request body for grounding.
   const runPrompt = (id: string | number, prompt: string, validationFindings?: unknown): Promise<void> =>
     runRequest('data-update', id, prompt, validationFindings);
   const runOptimizationDiagnosis = (id: string | number, message: string): Promise<void> =>

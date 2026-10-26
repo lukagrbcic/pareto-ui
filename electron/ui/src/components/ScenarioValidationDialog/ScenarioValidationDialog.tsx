@@ -37,6 +37,9 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
       </>}
     </DialogContent>
     <DialogActions>
+      {/* Fix with AI: hands the whole validation result to the AI dialog so the
+          fill targets the real issues; onAskAI is only provided when AI is
+          available, so non-AI setups never see this button. */}
       {!loading && result && onAskAI && (issues.length > 0 || result.state === 'infeasible') && <Button onClick={() => onAskAI(result)} variant="outlined">Fix with AI</Button>}
       {!loading && result?.valid && onCheckFeasibility && result.feasibility !== 'feasible' && <Button onClick={onCheckFeasibility} variant="outlined">Check feasibility</Button>}
       {!loading && !error && result?.valid && result.state !== 'outdated' && <Button onClick={onAdvance} disabled={advancing} variant="contained">Advance to Optimization Setup</Button>}

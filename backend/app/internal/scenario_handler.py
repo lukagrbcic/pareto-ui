@@ -69,16 +69,20 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     notes = []
     if not isinstance(updated_scenario, dict):
         return None, ["The AI response was not a valid scenario object, so no updates were applied."]
-    # Legacy provider responses wrap the inputs in a scenario-shaped object.
+    # Older/provider responses sometimes wrap the inputs in a scenario-shaped
+    # object; unwrap before validating (the frontend decoder does the same).
     if "df_parameters" not in updated_scenario and isinstance(updated_scenario.get("data_input"), dict):
         updated_scenario = updated_scenario["data_input"]
     if not isinstance(updated_scenario.get("df_parameters"), dict):
         return None, ["The AI response did not include the df_parameters input tables, so no updates were applied."]
+    # Deep-copy so we never alias or mutate the live scenario objects.
     cleaned = deepcopy(updated_scenario)
     original = original_data_input if isinstance(original_data_input, dict) else {}
     original_params = original.get("df_parameters") or {}
     params = cleaned["df_parameters"]
 
+    # Step 1: restore any original table the response dropped, so a careless
+    # regeneration cannot silently delete input data on save.
     restored = sorted(table for table in original_params if table not in params)
     for table in restored:
         params[table] = deepcopy(original_params[table])
@@ -86,6 +90,8 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
         notes.append("AI guard: the response dropped " + ", ".join(restored)
                      + "; the original table(s) were kept.")
 
+    # Step 2: revert entries that are not table-shaped (dict of column -> list);
+    # prefer the original values over corrupting the inputs.
     malformed = sorted(table for table, value in params.items() if not isinstance(value, dict))
     for table in malformed:
         if table in original_params:
@@ -95,12 +101,14 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     if malformed:
         notes.append("AI guard: replaced malformed entries with original values for " + ", ".join(malformed) + ".")
 
+    # Step 3: adding a table can be legitimate (filling a required table that
+    # was missing), so keep it but flag it for the user to review.
     added = sorted(table for table in params if table not in original_params)
     if added:
         notes.append("AI guard: the response added new table(s) " + ", ".join(added)
                      + "; review them before saving.")
 
-    # df_sets gets the same protection: the merge on save replaces the whole
+    # Step 4: protect df_sets the same way — the save merge replaces the whole
     # section, so dropped or malformed set entries would silently lose data.
     if "df_sets" in cleaned or "df_sets" in original:
         original_sets = original.get("df_sets") or {}
@@ -138,6 +146,8 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
                 notes.append("AI guard: the response added new set entries " + ", ".join(added_sets)
                              + "; review them before saving.")
 
+    # Final step: drop top-level sections the AI invented (anything that was
+    # not in the original data_input, plus the two always-legitimate keys).
     allowed_keys = set(original) | {"df_sets", "df_parameters"}
     removed = sorted(key for key in cleaned if key not in allowed_keys)
     for key in removed:
@@ -876,6 +886,9 @@ class ScenarioHandler:
                 "detail": "AI client is not configured. Provide an API key to enable AI features."
             }
         if data_input:
+            # Assemble the grounded prompt: response contract + retrieved PARETO
+            # docs + model requirements for the current settings + validation
+            # findings (when provided) + the full scenario + the user's prompt.
             prompt = FormatPrompt(user_prompt=user_prompt, data=data_input, optimization_settings=scenario.get("optimization"), validation_findings=validation_findings)
             # _log.info(f"full prompt: {prompt}")
             _log.info(f"hitting cborg now")
@@ -900,6 +913,10 @@ class ScenarioHandler:
                 _log.info(f"error response from AI: {answer.get('errorMessage')}")
                 return answer
 
+            # Structural guard: the model re-emits the whole scenario, so check
+            # it for dropped tables, malformed entries, and invented sections
+            # before it can reach the review/save flow. An unusable response
+            # becomes a clean error; valid questions survive the rejection.
             guard_notes = []
             updatedScenario = answer.get("updatedScenario")
             if updatedScenario is not None:
@@ -912,6 +929,8 @@ class ScenarioHandler:
                         error_response["questions"] = [q.strip() for q in questions]
                     return error_response
                 answer["updatedScenario"] = cleaned_scenario
+            # Normalize the model's updateNotes into a clean list of strings;
+            # drop malformed payloads (with a log) instead of failing the UI.
             notes = answer.get("updateNotes")
             if isinstance(notes, str):
                 answer["updateNotes"] = [notes] if notes.strip() else []
@@ -924,8 +943,10 @@ class ScenarioHandler:
             elif notes is not None:
                 _log.info(f"dropping malformed AI updateNotes: {notes!r}")
                 answer.pop("updateNotes", None)
+            # Surface what the guard changed so the review dialog is never silent.
             if guard_notes:
                 answer["updateNotes"] = (answer.get("updateNotes") or []) + guard_notes
+            # Same validation for the questions list (short strings only).
             questions = answer.get("questions")
             if questions is not None:
                 if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):

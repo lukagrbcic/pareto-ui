@@ -163,6 +163,9 @@ def _index_path():
     return Path(__file__).resolve().parent / _INDEX_FILENAME
 
 
+# One read-only connection per index path, opened lazily and reused for the
+# process lifetime (FastAPI may call from different worker threads, hence
+# check_same_thread=False; the index file never changes at runtime).
 _index_connections = {}
 
 
@@ -222,6 +225,8 @@ def _retrieve(query, budget_chars, max_chunks, exclude=(), extra_tokens=()):
     except sqlite3.Error:
         return []
     excluded = {(doc, title.split(" (part ")[0]) for doc, title in exclude}
+    # Greedy packing: keep the best-ranked chunks until the character budget
+    # is exhausted, skipping anything that would not fit whole.
     selected, used = [], 0
     for doc, title, body in rows:
         key = (doc, title.split(" (part ")[0])
@@ -292,6 +297,8 @@ def _reference_header():
         parts.append(f"grounded in PARETO {installed} (the docs index does not record which version it was built from)")
     if built_at:
         parts.append(f"docs built {built_at[:10]}")
+    # Conditional expression: render "base (detail; detail)" when any
+    # provenance detail exists, otherwise the bare header.
     return f"{base} (" + "; ".join(parts) + ")" if parts else base
 
 

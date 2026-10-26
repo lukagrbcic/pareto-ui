@@ -198,6 +198,8 @@ export const requestAIDataUpdate = async (backend_port: number, id: ScenarioId, 
         method: 'POST',
         mode: 'cors',
         headers: {'Content-Type': 'application/json'},
+        // Attach validation evidence when provided so the backend embeds it in
+        // the fill prompt; omit the key entirely for standalone prompt-only runs.
         body: JSON.stringify(validationFindings != null ? {"prompt": prompt, "validation_findings": validationFindings} : {"prompt": prompt})
     });
 }

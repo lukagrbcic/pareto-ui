@@ -407,7 +407,12 @@ def build_map_data_from_json(data_input):
     return map_data
 
 def _units_defaults_block():
-    """Units and blank-cell conventions for the scenario inputs."""
+    """Units and blank-cell conventions for the scenario inputs.
+
+    Tells the model which display units the app uses (DEFAULT_UNITS) and that
+    blank cells mean "never filled" — not zero — so it must not fill blanks
+    with 0 unless the documented default for that table is actually 0.
+    """
     return (
         "Units and defaults: the scenario's display units are "
         f"{json.dumps(DEFAULT_UNITS)}. Blank cells mean an input was never filled; they are not zeros, "
@@ -426,6 +431,8 @@ def _model_requirements_block(optimization_settings):
     if not optimization_settings:
         return ""
     try:
+        # Reuse the same settings resolution the optimizer uses, so the model
+        # sees exactly the configuration that will be built.
         model_parameters = prepare_config({"optimization": optimization_settings},
                                           expected_response="modelParameters")
     except Exception:
@@ -470,15 +477,22 @@ def FormatPrompt(user_prompt, data = None, optimization_settings = None, validat
     ## TODO:
     # Some of the input tables operate under a set of rules. For example, some tables can only use values from other tables.
     # If we can define these rules, it should improve how well this works.
+    # Core referential rules the model must follow when editing data.
     dataset_rules = ("Dataset rules: only use identifiers (node names, periods, options) that already exist "
                      "in the scenario's sets and tables; never delete existing tables or rows.\n")
 
+    # Assembled grounding blocks, injected between the response contract and
+    # the scenario JSON so they frame how the model reads the data.
     units_defaults = _units_defaults_block()
     model_requirements = _model_requirements_block(optimization_settings)
 
+    # Retrieved PARETO documentation chunks (user prompt + enabled features as
+    # retrieval cues). Empty string when the docs index is unavailable.
     reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
     reference = f"{reference_docs}\n\n" if reference_docs else ""
 
+    # Live validation findings (when handed over via "Fix with AI" or auto-
+    # attached from the last run) steer the fill toward the actual problems.
     validation = ""
     if validation_findings:
         validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
@@ -515,6 +529,9 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
 
     scenario_data = f"Scenario context:\n{scenario}\n\n" if scenario else ""
     diagnosis_data = f"Diagnosis context:\n{diagnosis_context}\n\n" if diagnosis_context else ""
+    # Retrieved PARETO docs, cued by the failure message itself (plus enabled
+    # features) so solver errors get grounded explanations. Empty string
+    # without the docs index.
     reference_docs = diagnosis_reference_docs(optimization_settings, error_message)
     reference = f"{reference_docs}\n\n" if reference_docs else ""
     return f"{user_disclosure}{reference}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"

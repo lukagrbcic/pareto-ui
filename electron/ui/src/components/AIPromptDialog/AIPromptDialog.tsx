@@ -30,6 +30,13 @@ interface AIPromptDialogProps {
 
 const DIFF_PREVIEW_ROWS = 6;
 
+/**
+ * One table of the AI review diff. Renders only rows that actually changed,
+ * all columns (horizontal scroll), with a row preview cap plus a
+ * "Show all N rows" toggle so large fills stay reviewable. Headers and cells
+ * wrap long camelCase names (overflowWrap) instead of overlapping neighbors;
+ * changed cells get the highlighted border/background.
+ */
 interface DiffTableData {
   key: string;
   columns: string[];
@@ -118,7 +125,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
   const [prompt, setPrompt] = useState("");
   const [promptError, setPromptError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"notes" | "diff">("notes");
+  // Per-table expansion state for the review diff; reset whenever a new AI
+  // result arrives so a fresh response always starts at the preview size.
   const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
+  // Answers to the assistant's questions, keyed by question text; assembled
+  // into a Q/A transcript on the next run (see questionTranscript).
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const aiDataInput = updatedScenario;
 
@@ -126,6 +137,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
     setExpandedTables(new Set());
   }, [updatedScenario]);
 
+  // New questions from a fresh response start with empty answer fields.
   useEffect(() => {
     setAnswers({});
   }, [questions]);
@@ -137,6 +149,13 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
     return "Ready";
   }, [status]);
 
+  /**
+   * Turns answered questions into a self-describing transcript appended to the
+   * outgoing prompt. The AI calls are stateless — the model never saw its own
+   * questions — so the transcript carries the Q/A pairs explicitly:
+   *   "Answers to your previous questions:\nQ: ...\nA: ..."
+   * Unanswered questions are omitted.
+   */
   const questionTranscript = useMemo(() => {
     const answered = questions
       .map((question) => ({ question, answer: (answers[question] || "").trim() }))
@@ -158,6 +177,10 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
     await runPrompt(scenarioId, outgoing, validationFindings);
   };
 
+  // Review-before-apply: nothing is saved automatically. The merged scenario
+  // (original data_input + AI data_input) is saved only when the user clicks
+  // "Save Updates", and a successful save triggers onApplied (Bottombar then
+  // re-runs validation).
   const handleSaveUpdates = async (): Promise<void> => {
     if (!scenarioData || !updatedScenario) return;
     const mergedScenario = {
@@ -197,6 +220,10 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
 
   const hasUpdates = updateNotes.length > 0;
   const showSuccessPanel = status === "success";
+  // Flattens each note onto its own bullet and strips leading markdown
+  // markers, so a model that ignores the one-note-per-bullet contract still
+  // renders as a scannable list instead of a wall of text. Also removes the
+  // "df_parameters['Table']" prefix the model sometimes adds.
   const sanitizedUpdateNotes = useMemo(() => {
     const stripPrefix = (note: string): string =>
       note

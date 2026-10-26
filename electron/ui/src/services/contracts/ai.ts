@@ -106,6 +106,8 @@ const failure = (value: unknown, path: string): AIPromptResponse | null => {
   })(value, path);
   const message = body.errorMessage || body.detail || body.error;
   if (!message?.trim()) throw new DecodeError(path, 'an AI error message');
+  // questions survive error responses too: the structural guard can reject an
+  // unusable scenario while still asking the user targeted follow-ups.
   return { status: 'error', errorMessage: message, questions: body.questions };
 };
 
@@ -114,11 +116,15 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
   if (error) return error;
   const result = object({
     status: literal('success'),
+    // updatedScenario is optional: a questions-only response (the assistant
+    // asking instead of inventing values) is a valid success.
     updatedScenario: optional(unknown),
     updateNotes: optional(array(string)),
     updatedNotes: optional(array(string)),
     questions: optional(array(string)),
   })(value, path);
+  // But a success must carry updates OR questions — neither is a malformed
+  // response the UI cannot act on.
   if (result.updatedScenario === undefined && result.questions === undefined)
     throw new DecodeError(path, 'an AI response with updates or questions');
   return {

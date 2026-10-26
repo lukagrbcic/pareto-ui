@@ -20,6 +20,12 @@ import openai
 load_dotenv()
 
 
+# Domain persona prepended to every AI request (see OpenAIClientWrapper.chat).
+# It tells the model what PARETO is, which input tables and flow decisions exist,
+# what the user can and cannot do in the app (no unit or source edits), and how
+# to behave: cite real node/table/period names, never invent absent values,
+# mark hypotheses as hypotheses, and answer in the pure-JSON contract the
+# callers parse.
 PARETO_SYSTEM_PROMPT = """You are a senior optimization engineer and subject-matter expert in strategic \
 produced-water management with the PARETO framework, an open-source strategic planning tool for water \
 management in shale oil and gas operations. You assist users of the PARETO UI desktop application with \

@@ -317,14 +317,32 @@ Excludes the AI-feature review tests (`backend/tests_ai/`, `electron/ui/src/test
 and the two docs files; those are personal review artifacts, not feature code.
 
 ```diff
+diff --git a/.gitignore b/.gitignore
+index 1ad5ecb..6f31b37 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -147,4 +147,5 @@ screenshots/
+ idaes-extensions/
+ idaes_extensions/
+ extensions/
+-*_testing*
+\ No newline at end of file
++*_testing*
++/pareto_docs*
 diff --git a/backend/app/internal/ai/client.py b/backend/app/internal/ai/client.py
-index 1ccccf6..018e87f 100644
+index 1ccccf6..a5555a6 100644
 --- a/backend/app/internal/ai/client.py
 +++ b/backend/app/internal/ai/client.py
-@@ -20,15 +20,46 @@ import openai
+@@ -20,15 +20,52 @@ import openai
  load_dotenv()
  
  
++# Domain persona prepended to every AI request (see OpenAIClientWrapper.chat).
++# It tells the model what PARETO is, which input tables and flow decisions exist,
++# what the user can and cannot do in the app (no unit or source edits), and how
++# to behave: cite real node/table/period names, never invent absent values,
++# mark hypotheses as hypotheses, and answer in the pure-JSON contract the
++# callers parse.
 +PARETO_SYSTEM_PROMPT = """You are a senior optimization engineer and subject-matter expert in strategic \
 +produced-water management with the PARETO framework, an open-source strategic planning tool for water \
 +management in shale oil and gas operations. You assist users of the PARETO UI desktop application with \
@@ -369,7 +387,7 @@ index 1ccccf6..018e87f 100644
      ):
          """
          Create the wrapper.
-@@ -40,6 +71,7 @@ class OpenAIClientWrapper:
+@@ -40,6 +77,7 @@ class OpenAIClientWrapper:
              default_temperature: default temperature for calls.
              max_retries: number of retries for transient errors.
              backoff_factor: multiplier for exponential backoff (seconds).
@@ -377,7 +395,7 @@ index 1ccccf6..018e87f 100644
          """
          if api_key is None:
              api_key = os.environ.get("CBORG_API_KEY") or os.environ.get("OPENAI_API_KEY")
-@@ -56,6 +88,7 @@ class OpenAIClientWrapper:
+@@ -56,6 +94,7 @@ class OpenAIClientWrapper:
          self.default_temperature = default_temperature
          self.max_retries = max_retries
          self.backoff_factor = backoff_factor
@@ -385,7 +403,7 @@ index 1ccccf6..018e87f 100644
  
          # chat history (list of message dicts as expected by OpenAI chat API)
          # Example: {"role": "system", "content": "..."}
-@@ -89,6 +122,10 @@ class OpenAIClientWrapper:
+@@ -89,6 +128,10 @@ class OpenAIClientWrapper:
          """Change the model to use for subsequent calls."""
          self.model = model_name
  
@@ -396,7 +414,7 @@ index 1ccccf6..018e87f 100644
      def set_api_key(self, api_key: Optional[str], base_url: Optional[str] = None) -> None:
          """Change API key (reinitializes underlying client)."""
          self.api_key = api_key.strip() if api_key else None
-@@ -164,6 +201,10 @@ class OpenAIClientWrapper:
+@@ -164,6 +207,10 @@ class OpenAIClientWrapper:
          if prompt is not None:
              request_messages.append({"role": "user", "content": prompt})
  
@@ -407,7 +425,7 @@ index 1ccccf6..018e87f 100644
          # use the client to call the chat completions endpoint
          def payload():
              create_kwargs = {
-@@ -266,7 +307,7 @@ base_url = os.environ.get("CBORG_BASE_URL", "https://api.cborg.lbl.gov")
+@@ -266,7 +313,7 @@ base_url = os.environ.get("CBORG_BASE_URL", "https://api.cborg.lbl.gov")
  cborg = OpenAIClientWrapper(
      api_key=os.environ.get("CBORG_API_KEY"),
      base_url=base_url,
@@ -433,10 +451,10 @@ index f4eb5ab..c96b3b5 100644
          return {
 diff --git a/backend/app/internal/ai/docs.py b/backend/app/internal/ai/docs.py
 new file mode 100644
-index 0000000..2984e76
+index 0000000..e0a9bf0
 --- /dev/null
 +++ b/backend/app/internal/ai/docs.py
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,366 @@
 +"""PARETO reference documentation for AI prompt grounding.
 +
 +Grounding comes from the prebuilt SQLite FTS5 index built by
@@ -602,6 +620,9 @@ index 0000000..2984e76
 +    return Path(__file__).resolve().parent / _INDEX_FILENAME
 +
 +
++# One read-only connection per index path, opened lazily and reused for the
++# process lifetime (FastAPI may call from different worker threads, hence
++# check_same_thread=False; the index file never changes at runtime).
 +_index_connections = {}
 +
 +
@@ -661,6 +682,8 @@ index 0000000..2984e76
 +    except sqlite3.Error:
 +        return []
 +    excluded = {(doc, title.split(" (part ")[0]) for doc, title in exclude}
++    # Greedy packing: keep the best-ranked chunks until the character budget
++    # is exhausted, skipping anything that would not fit whole.
 +    selected, used = [], 0
 +    for doc, title, body in rows:
 +        key = (doc, title.split(" (part ")[0])
@@ -731,6 +754,8 @@ index 0000000..2984e76
 +        parts.append(f"grounded in PARETO {installed} (the docs index does not record which version it was built from)")
 +    if built_at:
 +        parts.append(f"docs built {built_at[:10]}")
++    # Conditional expression: render "base (detail; detail)" when any
++    # provenance detail exists, otherwise the bare header.
 +    return f"{base} (" + "; ".join(parts) + ")" if parts else base
 +
 +
@@ -801,10 +826,10 @@ new file mode 100644
 index 0000000..ed6ece4
 Binary files /dev/null and b/backend/app/internal/ai/pareto_docs_index.sqlite differ
 diff --git a/backend/app/internal/scenario_handler.py b/backend/app/internal/scenario_handler.py
-index a30199a..652f3a9 100644
+index a30199a..e8f5f43 100644
 --- a/backend/app/internal/scenario_handler.py
 +++ b/backend/app/internal/scenario_handler.py
-@@ -56,6 +56,97 @@ def serialized(method):
+@@ -56,6 +56,107 @@ def serialized(method):
              return method(self, *args, **kwargs)
      return wrapped
  
@@ -821,16 +846,20 @@ index a30199a..652f3a9 100644
 +    notes = []
 +    if not isinstance(updated_scenario, dict):
 +        return None, ["The AI response was not a valid scenario object, so no updates were applied."]
-+    # Legacy provider responses wrap the inputs in a scenario-shaped object.
++    # Older/provider responses sometimes wrap the inputs in a scenario-shaped
++    # object; unwrap before validating (the frontend decoder does the same).
 +    if "df_parameters" not in updated_scenario and isinstance(updated_scenario.get("data_input"), dict):
 +        updated_scenario = updated_scenario["data_input"]
 +    if not isinstance(updated_scenario.get("df_parameters"), dict):
 +        return None, ["The AI response did not include the df_parameters input tables, so no updates were applied."]
++    # Deep-copy so we never alias or mutate the live scenario objects.
 +    cleaned = deepcopy(updated_scenario)
 +    original = original_data_input if isinstance(original_data_input, dict) else {}
 +    original_params = original.get("df_parameters") or {}
 +    params = cleaned["df_parameters"]
 +
++    # Step 1: restore any original table the response dropped, so a careless
++    # regeneration cannot silently delete input data on save.
 +    restored = sorted(table for table in original_params if table not in params)
 +    for table in restored:
 +        params[table] = deepcopy(original_params[table])
@@ -838,6 +867,8 @@ index a30199a..652f3a9 100644
 +        notes.append("AI guard: the response dropped " + ", ".join(restored)
 +                     + "; the original table(s) were kept.")
 +
++    # Step 2: revert entries that are not table-shaped (dict of column -> list);
++    # prefer the original values over corrupting the inputs.
 +    malformed = sorted(table for table, value in params.items() if not isinstance(value, dict))
 +    for table in malformed:
 +        if table in original_params:
@@ -847,12 +878,14 @@ index a30199a..652f3a9 100644
 +    if malformed:
 +        notes.append("AI guard: replaced malformed entries with original values for " + ", ".join(malformed) + ".")
 +
++    # Step 3: adding a table can be legitimate (filling a required table that
++    # was missing), so keep it but flag it for the user to review.
 +    added = sorted(table for table in params if table not in original_params)
 +    if added:
 +        notes.append("AI guard: the response added new table(s) " + ", ".join(added)
 +                     + "; review them before saving.")
 +
-+    # df_sets gets the same protection: the merge on save replaces the whole
++    # Step 4: protect df_sets the same way — the save merge replaces the whole
 +    # section, so dropped or malformed set entries would silently lose data.
 +    if "df_sets" in cleaned or "df_sets" in original:
 +        original_sets = original.get("df_sets") or {}
@@ -890,6 +923,8 @@ index a30199a..652f3a9 100644
 +                notes.append("AI guard: the response added new set entries " + ", ".join(added_sets)
 +                             + "; review them before saving.")
 +
++    # Final step: drop top-level sections the AI invented (anything that was
++    # not in the original data_input, plus the two always-legitimate keys).
 +    allowed_keys = set(original) | {"df_sets", "df_parameters"}
 +    removed = sorted(key for key in cleaned if key not in allowed_keys)
 +    for key in removed:
@@ -902,7 +937,7 @@ index a30199a..652f3a9 100644
  class ScenarioHandler:
      """Manage the saved scenarios."""
  
-@@ -769,7 +860,7 @@ class ScenarioHandler:
+@@ -769,7 +870,7 @@ class ScenarioHandler:
  
      
      @time_it
@@ -911,11 +946,14 @@ index a30199a..652f3a9 100644
          _log.info(f"generate_data_with_ai user prompt: {user_prompt}")
          try:
  
-@@ -785,18 +876,21 @@ class ScenarioHandler:
+@@ -785,18 +886,24 @@ class ScenarioHandler:
                  "detail": "AI client is not configured. Provide an API key to enable AI features."
              }
          if data_input:
 -            prompt = FormatPrompt(user_prompt=user_prompt, data=data_input)
++            # Assemble the grounded prompt: response contract + retrieved PARETO
++            # docs + model requirements for the current settings + validation
++            # findings (when provided) + the full scenario + the user's prompt.
 +            prompt = FormatPrompt(user_prompt=user_prompt, data=data_input, optimization_settings=scenario.get("optimization"), validation_findings=validation_findings)
              # _log.info(f"full prompt: {prompt}")
              _log.info(f"hitting cborg now")
@@ -937,12 +975,16 @@ index a30199a..652f3a9 100644
  
              ## sample prompt: Can you fill in completions demand with 10000 barrels in each time period
  
-@@ -805,8 +899,40 @@ class ScenarioHandler:
+@@ -805,8 +912,48 @@ class ScenarioHandler:
              if status == "error":
                  _log.info(f"error response from AI: {answer.get('errorMessage')}")
                  return answer
 -            
 +
++            # Structural guard: the model re-emits the whole scenario, so check
++            # it for dropped tables, malformed entries, and invented sections
++            # before it can reach the review/save flow. An unusable response
++            # becomes a clean error; valid questions survive the rejection.
 +            guard_notes = []
              updatedScenario = answer.get("updatedScenario")
 +            if updatedScenario is not None:
@@ -955,6 +997,8 @@ index a30199a..652f3a9 100644
 +                        error_response["questions"] = [q.strip() for q in questions]
 +                    return error_response
 +                answer["updatedScenario"] = cleaned_scenario
++            # Normalize the model's updateNotes into a clean list of strings;
++            # drop malformed payloads (with a log) instead of failing the UI.
 +            notes = answer.get("updateNotes")
 +            if isinstance(notes, str):
 +                answer["updateNotes"] = [notes] if notes.strip() else []
@@ -967,8 +1011,10 @@ index a30199a..652f3a9 100644
 +            elif notes is not None:
 +                _log.info(f"dropping malformed AI updateNotes: {notes!r}")
 +                answer.pop("updateNotes", None)
++            # Surface what the guard changed so the review dialog is never silent.
 +            if guard_notes:
 +                answer["updateNotes"] = (answer.get("updateNotes") or []) + guard_notes
++            # Same validation for the questions list (short strings only).
 +            questions = answer.get("questions")
 +            if questions is not None:
 +                if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
@@ -979,7 +1025,7 @@ index a30199a..652f3a9 100644
              return answer
          else:
              return {
-@@ -877,11 +1003,14 @@ class ScenarioHandler:
+@@ -877,11 +1024,14 @@ class ScenarioHandler:
          prompt = FormatOptimizationDiagnosisPrompt(
              error_message=truncated_failure_message,
              diagnosis_context=json.dumps(diagnosis_context, default=str),
@@ -996,7 +1042,7 @@ index a30199a..652f3a9 100644
          except Exception as e:
              _log.error(f"unable to parse diagnosis response: {e}")
 diff --git a/backend/app/internal/util.py b/backend/app/internal/util.py
-index 9a3aeb2..0e7b8ad 100644
+index 9a3aeb2..fd328b7 100644
 --- a/backend/app/internal/util.py
 +++ b/backend/app/internal/util.py
 @@ -1,3 +1,4 @@
@@ -1004,14 +1050,19 @@ index 9a3aeb2..0e7b8ad 100644
  import math
  import time
  import functools
-@@ -405,8 +406,61 @@ def build_map_data_from_json(data_input):
+@@ -405,8 +406,68 @@ def build_map_data_from_json(data_input):
  
      return map_data
  
 -def FormatPrompt(user_prompt, data = None):
 -    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON with the updated JSON scenario object. Along with the updated scenario, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. Please also provide a detailed 'updateNotes', so that I can explain to the user what was updated.\n"
 +def _units_defaults_block():
-+    """Units and blank-cell conventions for the scenario inputs."""
++    """Units and blank-cell conventions for the scenario inputs.
++
++    Tells the model which display units the app uses (DEFAULT_UNITS) and that
++    blank cells mean "never filled" — not zero — so it must not fill blanks
++    with 0 unless the documented default for that table is actually 0.
++    """
 +    return (
 +        "Units and defaults: the scenario's display units are "
 +        f"{json.dumps(DEFAULT_UNITS)}. Blank cells mean an input was never filled; they are not zeros, "
@@ -1030,6 +1081,8 @@ index 9a3aeb2..0e7b8ad 100644
 +    if not optimization_settings:
 +        return ""
 +    try:
++        # Reuse the same settings resolution the optimizer uses, so the model
++        # sees exactly the configuration that will be built.
 +        model_parameters = prepare_config({"optimization": optimization_settings},
 +                                          expected_response="modelParameters")
 +    except Exception:
@@ -1068,21 +1121,28 @@ index 9a3aeb2..0e7b8ad 100644
  
      if data:
          prompt_data = f"Here is the scenario: {data}\n\n"
-@@ -416,13 +470,26 @@ def FormatPrompt(user_prompt, data = None):
+@@ -416,13 +477,33 @@ def FormatPrompt(user_prompt, data = None):
      ## TODO:
      # Some of the input tables operate under a set of rules. For example, some tables can only use values from other tables.
      # If we can define these rules, it should improve how well this works.
 -    dataset_rules = "" # f"Some rules about the dataset:\n"
++    # Core referential rules the model must follow when editing data.
 +    dataset_rules = ("Dataset rules: only use identifiers (node names, periods, options) that already exist "
 +                     "in the scenario's sets and tables; never delete existing tables or rows.\n")
 +
++    # Assembled grounding blocks, injected between the response contract and
++    # the scenario JSON so they frame how the model reads the data.
 +    units_defaults = _units_defaults_block()
 +    model_requirements = _model_requirements_block(optimization_settings)
 +
++    # Retrieved PARETO documentation chunks (user prompt + enabled features as
++    # retrieval cues). Empty string when the docs index is unavailable.
 +    reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
 +    reference = f"{reference_docs}\n\n" if reference_docs else ""
  
 -    prompt = f"{user_disclosure}{dataset_rules}{prompt_data}Here is the prompt:\n{user_prompt}"
++    # Live validation findings (when handed over via "Fix with AI" or auto-
++    # attached from the last run) steer the fill toward the actual problems.
 +    validation = ""
 +    if validation_findings:
 +        validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
@@ -1098,11 +1158,14 @@ index 9a3aeb2..0e7b8ad 100644
      user_disclosure = (
          "You are diagnosing a failed PARETO optimization run inside a desktop application. "
          "The optimization model comes from the project-pareto Python package and uses the pyomo Python package underneath. "
-@@ -448,7 +515,9 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
+@@ -448,7 +529,12 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
  
      scenario_data = f"Scenario context:\n{scenario}\n\n" if scenario else ""
      diagnosis_data = f"Diagnosis context:\n{diagnosis_context}\n\n" if diagnosis_context else ""
 -    return f"{user_disclosure}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
++    # Retrieved PARETO docs, cued by the failure message itself (plus enabled
++    # features) so solver errors get grounded explanations. Empty string
++    # without the docs index.
 +    reference_docs = diagnosis_reference_docs(optimization_settings, error_message)
 +    reference = f"{reference_docs}\n\n" if reference_docs else ""
 +    return f"{user_disclosure}{reference}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
@@ -1110,13 +1173,15 @@ index 9a3aeb2..0e7b8ad 100644
  def summarize_long_text(text, start_chars=6000, end_chars=4000):
      if text is None:
 diff --git a/backend/app/routers/scenarios.py b/backend/app/routers/scenarios.py
-index d799efb..b091741 100644
+index d799efb..a163ac0 100644
 --- a/backend/app/routers/scenarios.py
 +++ b/backend/app/routers/scenarios.py
-@@ -542,8 +542,11 @@ async def request_ai_data_update(request: Request, id: int) -> dict:
+@@ -542,8 +542,13 @@ async def request_ai_data_update(request: Request, id: int) -> dict:
      """
      req = await request.json()
      prompt = req.get("prompt", None)
++    # Optional validation evidence from the UI ("Fix with AI" or the last
++    # validation run); embedded into the prompt so the fill targets real issues.
 +    validation_findings = req.get("validation_findings", None)
 +    if validation_findings is not None and not isinstance(validation_findings, (list, dict)):
 +        raise HTTPException(400, detail="validation_findings must be a list or object.")
@@ -1374,7 +1439,7 @@ index 0000000..a18e2b2
 +print(f"Chunks:  {meta.get('chunk_count')} ({meta.get('chunks_per_doc')})")
 +print("Try:  search('pipeline capacity')   show(0)   doc('strategic')")
 diff --git a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx b/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
-index ce2d02a..a5c518c 100644
+index ce2d02a..b24de6a 100644
 --- a/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
 +++ b/electron/ui/src/components/AIPromptDialog/AIPromptDialog.tsx
 @@ -1,5 +1,6 @@
@@ -1385,7 +1450,7 @@ index ce2d02a..a5c518c 100644
    Box,
    Button,
    Chip,
-@@ -23,24 +24,112 @@ interface AIPromptDialogProps {
+@@ -23,24 +24,124 @@ interface AIPromptDialogProps {
    onClose: () => void;
    scenarioId: string | number | null | undefined;
    scenarioName?: string;
@@ -1395,6 +1460,13 @@ index ce2d02a..a5c518c 100644
 +
 +const DIFF_PREVIEW_ROWS = 6;
 +
++/**
++ * One table of the AI review diff. Renders only rows that actually changed,
++ * all columns (horizontal scroll), with a row preview cap plus a
++ * "Show all N rows" toggle so large fills stay reviewable. Headers and cells
++ * wrap long camelCase names (overflowWrap) instead of overlapping neighbors;
++ * changed cells get the highlighted border/background.
++ */
 +interface DiffTableData {
 +  key: string;
 +  columns: string[];
@@ -1485,7 +1557,11 @@ index ce2d02a..a5c518c 100644
    const [prompt, setPrompt] = useState("");
    const [promptError, setPromptError] = useState<string | null>(null);
    const [viewMode, setViewMode] = useState<"notes" | "diff">("notes");
++  // Per-table expansion state for the review diff; reset whenever a new AI
++  // result arrives so a fresh response always starts at the preview size.
 +  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
++  // Answers to the assistant's questions, keyed by question text; assembled
++  // into a Q/A transcript on the next run (see questionTranscript).
 +  const [answers, setAnswers] = useState<Record<string, string>>({});
    const aiDataInput = updatedScenario;
  
@@ -1493,6 +1569,7 @@ index ce2d02a..a5c518c 100644
 +    setExpandedTables(new Set());
 +  }, [updatedScenario]);
 +
++  // New questions from a fresh response start with empty answer fields.
 +  useEffect(() => {
 +    setAnswers({});
 +  }, [questions]);
@@ -1500,10 +1577,17 @@ index ce2d02a..a5c518c 100644
    const statusLabel = useMemo(() => {
      if (status === "running") return "Running";
      if (status === "success") return "Completed";
-@@ -48,17 +137,28 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -48,17 +149,39 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
      return "Ready";
    }, [status]);
  
++  /**
++   * Turns answered questions into a self-describing transcript appended to the
++   * outgoing prompt. The AI calls are stateless — the model never saw its own
++   * questions — so the transcript carries the Q/A pairs explicitly:
++   *   "Answers to your previous questions:\nQ: ...\nA: ..."
++   * Unanswered questions are omitted.
++   */
 +  const questionTranscript = useMemo(() => {
 +    const answered = questions
 +      .map((question) => ({ question, answer: (answers[question] || "").trim() }))
@@ -1528,11 +1612,15 @@ index ce2d02a..a5c518c 100644
    };
  
 -  const handleSaveUpdates = (): void => {
++  // Review-before-apply: nothing is saved automatically. The merged scenario
++  // (original data_input + AI data_input) is saved only when the user clicks
++  // "Save Updates", and a successful save triggers onApplied (Bottombar then
++  // re-runs validation).
 +  const handleSaveUpdates = async (): Promise<void> => {
      if (!scenarioData || !updatedScenario) return;
      const mergedScenario = {
        ...scenarioData,
-@@ -67,7 +167,20 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -67,7 +190,20 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          ...aiDataInput,
        },
      };
@@ -1554,7 +1642,7 @@ index ce2d02a..a5c518c 100644
    };
  
    const handleClearPrompt = (): void => {
-@@ -75,6 +188,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -75,6 +211,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
      setPrompt("");
      setPromptError(null);
      setViewMode("notes");
@@ -1562,7 +1650,16 @@ index ce2d02a..a5c518c 100644
    };
  
    const handleClose = (): void => {
-@@ -88,7 +202,16 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -83,12 +220,25 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+ 
+   const hasUpdates = updateNotes.length > 0;
+   const showSuccessPanel = status === "success";
++  // Flattens each note onto its own bullet and strips leading markdown
++  // markers, so a model that ignores the one-note-per-bullet contract still
++  // renders as a scannable list instead of a wall of text. Also removes the
++  // "df_parameters['Table']" prefix the model sometimes adds.
+   const sanitizedUpdateNotes = useMemo(() => {
+     const stripPrefix = (note: string): string =>
        note
          .replace(/df_parameters\[['"]([^'"]+)['"]\]/g, "$1")
          .replace(/df_parameters\./g, "");
@@ -1580,7 +1677,7 @@ index ce2d02a..a5c518c 100644
    }, [updateNotes]);
    const diffTables = useMemo(() => {
      if (!scenarioData || !aiDataInput) return [];
-@@ -100,7 +223,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -100,7 +250,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
        columns: string[];
        rows: Array<{ index: number; cells: any[]; changed: boolean[] }>;
        totalChangedRows: number;
@@ -1588,7 +1685,7 @@ index ce2d02a..a5c518c 100644
        nonTabular: boolean;
      }> = [];
  
-@@ -131,7 +253,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -131,7 +280,6 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
            columns: [],
            rows: [],
            totalChangedRows: 0,
@@ -1596,7 +1693,7 @@ index ce2d02a..a5c518c 100644
            nonTabular: true,
          });
          return;
-@@ -171,17 +292,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -171,17 +319,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          }
        }
  
@@ -1616,7 +1713,7 @@ index ce2d02a..a5c518c 100644
          nonTabular: false,
        });
      });
-@@ -194,7 +309,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -194,7 +336,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
        open={open}
        onClose={handleClose}
        fullWidth
@@ -1625,7 +1722,7 @@ index ce2d02a..a5c518c 100644
        PaperProps={{
          sx: {
            borderRadius: 3,
-@@ -223,6 +338,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -223,6 +365,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
          </Stack>
        </DialogTitle>
        <DialogContent sx={{ pt: 1 }}>
@@ -1637,7 +1734,7 @@ index ce2d02a..a5c518c 100644
          <TextField
            value={prompt}
            onChange={(event) => setPrompt(event.target.value)}
-@@ -248,6 +368,36 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -248,6 +395,36 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
              {errorMessage}
            </Typography>
          )}
@@ -1674,7 +1771,7 @@ index ce2d02a..a5c518c 100644
          {showSuccessPanel && (
            <Box sx={{ mt: 3, p: 2, borderRadius: 2, bgcolor: "rgba(1, 103, 143, 0.08)" }}>
              <Tabs
-@@ -299,56 +449,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
+@@ -299,56 +476,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element
                          </Typography>
                        </Box>
                      ) : (
@@ -1733,7 +1830,7 @@ index ce2d02a..a5c518c 100644
                    </Box>
                  ))}
 diff --git a/electron/ui/src/components/Bottombar/Bottombar.tsx b/electron/ui/src/components/Bottombar/Bottombar.tsx
-index 3c7df1c..17c8dad 100644
+index 3c7df1c..b125cf0 100644
 --- a/electron/ui/src/components/Bottombar/Bottombar.tsx
 +++ b/electron/ui/src/components/Bottombar/Bottombar.tsx
 @@ -50,6 +50,7 @@ export default function Bottombar(props) {
@@ -1744,12 +1841,14 @@ index 3c7df1c..17c8dad 100644
      const [ key, setKey ] =  useState(null)
      const [ hasOverride, setHasOverride ] = useState(false)
      const [ openValidationDialog, setOpenValidationDialog ] = useState(false)
-@@ -61,13 +62,30 @@ export default function Bottombar(props) {
+@@ -61,13 +62,36 @@ export default function Bottombar(props) {
      useEffect(() => {
        setValidationResult(null); setValidationLoading(false); setValidationAdvancing(false); setValidationError(null);
        setOpenValidationDialog(false);
 +      setAiValidationFindings(null);
        return () => { validationVersion.current += 1; };
++      // Clearing on scenario/revision changes keeps stale AI findings from a
++      // previous revision out of the next fill request.
      }, [id, scenario?.input_revision, props.saving, inputDataEdited]);
      const handleOpenSaveModal = () => setOpenSaveModal(true);
      const handleCloseSaveModal = () => setOpenSaveModal(false);
@@ -1765,11 +1864,15 @@ index 3c7df1c..17c8dad 100644
 +      setOpenAIPrompt(true);
 +    };
 +    const handleCloseAIPrompt = () => { setOpenAIPrompt(false); setAiValidationFindings(null); };
++    // "Fix with AI" in the validation dialog: hand the whole validation result
++    // to the AI dialog so the fill prompt targets the actual issues.
 +    const handleFixValidationWithAI = (result: ScenarioValidation) => {
 +      setOpenValidationDialog(false);
 +      setAiValidationFindings(result);
 +      setOpenAIPrompt(true);
 +    };
++    // Close the review-apply loop: after AI updates are saved, validation
++    // re-runs automatically so the user immediately sees what remains.
 +    const handleAIUpdatesApplied = () => {
 +      handleCloseAIPrompt();
 +      handleValidateScenario();
@@ -1777,25 +1880,29 @@ index 3c7df1c..17c8dad 100644
      const handleCloseValidationDialog = () => setOpenValidationDialog(false);
  
  
-@@ -349,6 +367,8 @@ export default function Bottombar(props) {
+@@ -349,6 +373,10 @@ export default function Bottombar(props) {
          onClose={handleCloseAIPrompt}
          scenarioId={id}
          scenarioName={name}
++        // Findings captured from "Fix with AI" or the last validation run;
++        // onApplied re-validates after the user saves AI updates.
 +        validationFindings={aiValidationFindings}
 +        onApplied={handleAIUpdatesApplied}
        />}
        <ScenarioValidationDialog
          open={openValidationDialog}
-@@ -360,6 +380,7 @@ export default function Bottombar(props) {
+@@ -360,6 +388,9 @@ export default function Bottombar(props) {
          onSelectTable={handleSelectValidationTable}
          onCheckFeasibility={() => handleValidateScenario(true)}
          onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
++        // Only offer "Fix with AI" when AI is configured, so non-AI setups see
++        // exactly main's validation dialog.
 +        onAskAI={isAIAvailable ? handleFixValidationWithAI : undefined}
          onClose={handleCloseValidationDialog}
        />
      </Box>
 diff --git a/electron/ui/src/components/ScenarioValidationDialog/ScenarioValidationDialog.tsx b/electron/ui/src/components/ScenarioValidationDialog/ScenarioValidationDialog.tsx
-index 9cff7d9..f0f871a 100644
+index 9cff7d9..7251de3 100644
 --- a/electron/ui/src/components/ScenarioValidationDialog/ScenarioValidationDialog.tsx
 +++ b/electron/ui/src/components/ScenarioValidationDialog/ScenarioValidationDialog.tsx
 @@ -13,10 +13,10 @@ const STATES: Record<string, string> = {
@@ -1811,16 +1918,19 @@ index 9cff7d9..f0f871a 100644
  }) {
    const issues = result?.issues || [];
    return <Dialog open={open} onClose={loading ? undefined : onClose} fullWidth maxWidth="md">
-@@ -37,6 +37,7 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
+@@ -37,6 +37,10 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
        </>}
      </DialogContent>
      <DialogActions>
++      {/* Fix with AI: hands the whole validation result to the AI dialog so the
++          fill targets the real issues; onAskAI is only provided when AI is
++          available, so non-AI setups never see this button. */}
 +      {!loading && result && onAskAI && (issues.length > 0 || result.state === 'infeasible') && <Button onClick={() => onAskAI(result)} variant="outlined">Fix with AI</Button>}
        {!loading && result?.valid && onCheckFeasibility && result.feasibility !== 'feasible' && <Button onClick={onCheckFeasibility} variant="outlined">Check feasibility</Button>}
        {!loading && !error && result?.valid && result.state !== 'outdated' && <Button onClick={onAdvance} disabled={advancing} variant="contained">Advance to Optimization Setup</Button>}
        <Button onClick={onClose} disabled={loading}>Close</Button>
 diff --git a/electron/ui/src/context/AIPromptContext.tsx b/electron/ui/src/context/AIPromptContext.tsx
-index b2618ed..dc190d1 100644
+index b2618ed..958f56f 100644
 --- a/electron/ui/src/context/AIPromptContext.tsx
 +++ b/electron/ui/src/context/AIPromptContext.tsx
 @@ -22,9 +22,10 @@ export interface AIPromptContextValue {
@@ -1835,15 +1945,18 @@ index b2618ed..dc190d1 100644
    runOptimizationDiagnosis: (scenarioId: string | number, errorMessage: string) => Promise<void>;
    clearResult: () => void;
  }
-@@ -59,6 +60,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -59,6 +60,10 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
    const [errorMessage, setErrorMessage] = useState<string | null>(null);
    const [updatedScenario, setUpdatedScenario] = useState<AIPromptUpdatedScenario | null>(null);
    const [updateNotes, setUpdateNotes] = useState<string[]>([]);
 +  const [questions, setQuestions] = useState<string[]>([]);
++  // The assistant's follow-up questions from the latest fill response. Rendered
++  // with inline answer fields in the dialog; cleared on new runs (see runRequest)
++  // so stale questions never mix with a fresh response.
    const [lastPrompt, setLastPrompt] = useState<string | null>(null);
  
    useEffect(() => {
-@@ -93,6 +95,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -93,6 +98,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      kind: Exclude<AIPromptRequestKind, null>,
      id: string | number,
      text: string,
@@ -1851,7 +1964,7 @@ index b2618ed..dc190d1 100644
    ): Promise<void> => {
      if (!isAvailable || requestPending.current) return;
      requestPending.current = true;
-@@ -105,22 +108,27 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -105,22 +111,27 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      setDiagnosis(null);
      setUpdatedScenario(null);
      setUpdateNotes([]);
@@ -1880,18 +1993,20 @@ index b2618ed..dc190d1 100644
        } else {
          const payload = await requestAIOptimizationDiagnosis(port, idNumber, text);
          if (version !== requestVersion.current) return;
-@@ -141,8 +149,8 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -141,8 +152,10 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      }
    };
  
 -  const runPrompt = (id: string | number, prompt: string): Promise<void> =>
 -    runRequest('data-update', id, prompt);
++  // validationFindings: optional validation evidence (from "Fix with AI" or the
++  // last validation run) forwarded into the request body for grounding.
 +  const runPrompt = (id: string | number, prompt: string, validationFindings?: unknown): Promise<void> =>
 +    runRequest('data-update', id, prompt, validationFindings);
    const runOptimizationDiagnosis = (id: string | number, message: string): Promise<void> =>
      runRequest('optimization-diagnosis', id, message);
  
-@@ -157,6 +165,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -157,6 +170,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
      setDiagnosis(null);
      setUpdatedScenario(null);
      setUpdateNotes([]);
@@ -1899,7 +2014,7 @@ index b2618ed..dc190d1 100644
      setLastPrompt(null);
    };
  
-@@ -172,6 +181,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -172,6 +186,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
        diagnosis,
        updatedScenario,
        updateNotes,
@@ -1907,7 +2022,7 @@ index b2618ed..dc190d1 100644
        errorMessage,
        lastPrompt,
        runPrompt,
-@@ -187,6 +197,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
+@@ -187,6 +202,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children })
        diagnosis,
        updatedScenario,
        updateNotes,
@@ -1916,10 +2031,10 @@ index b2618ed..dc190d1 100644
        lastPrompt,
      ],
 diff --git a/electron/ui/src/services/app.service.ts b/electron/ui/src/services/app.service.ts
-index b4f1024..575e7f2 100644
+index b4f1024..8385b7c 100644
 --- a/electron/ui/src/services/app.service.ts
 +++ b/electron/ui/src/services/app.service.ts
-@@ -192,13 +192,13 @@ export const saveAISettings = (backend_port: number, settings: {api_key?: string
+@@ -192,13 +192,15 @@ export const saveAISettings = (backend_port: number, settings: {api_key?: string
  export const resetAISettings = (backend_port: number): Promise<AIBackendSettings> =>
      requestJson(`${BACKEND_URL}:${backend_port}/ai_settings`, decodeAIBackendSettings, {method: 'DELETE'});
  
@@ -1932,15 +2047,17 @@ index b4f1024..575e7f2 100644
          mode: 'cors',
          headers: {'Content-Type': 'application/json'},
 -        body: JSON.stringify({"prompt": prompt})
++        // Attach validation evidence when provided so the backend embeds it in
++        // the fill prompt; omit the key entirely for standalone prompt-only runs.
 +        body: JSON.stringify(validationFindings != null ? {"prompt": prompt, "validation_findings": validationFindings} : {"prompt": prompt})
      });
  }
  
 diff --git a/electron/ui/src/services/contracts/ai.ts b/electron/ui/src/services/contracts/ai.ts
-index b72610f..a69ad92 100644
+index b72610f..ebed078 100644
 --- a/electron/ui/src/services/contracts/ai.ts
 +++ b/electron/ui/src/services/contracts/ai.ts
-@@ -102,10 +102,11 @@ const failure = (value: unknown, path: string): AIPromptResponse | null => {
+@@ -102,10 +102,13 @@ const failure = (value: unknown, path: string): AIPromptResponse | null => {
      error: optional(string),
      errorMessage: optional(string),
      detail: optional(string),
@@ -1949,20 +2066,26 @@ index b72610f..a69ad92 100644
    const message = body.errorMessage || body.detail || body.error;
    if (!message?.trim()) throw new DecodeError(path, 'an AI error message');
 -  return { status: 'error', errorMessage: message };
++  // questions survive error responses too: the structural guard can reject an
++  // unusable scenario while still asking the user targeted follow-ups.
 +  return { status: 'error', errorMessage: message, questions: body.questions };
  };
  
  export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) => {
-@@ -113,14 +114,20 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
+@@ -113,14 +116,24 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
    if (error) return error;
    const result = object({
      status: literal('success'),
 -    updatedScenario: unknown,
++    // updatedScenario is optional: a questions-only response (the assistant
++    // asking instead of inventing values) is a valid success.
 +    updatedScenario: optional(unknown),
      updateNotes: optional(array(string)),
      updatedNotes: optional(array(string)),
 +    questions: optional(array(string)),
    })(value, path);
++  // But a success must carry updates OR questions — neither is a malformed
++  // response the UI cannot act on.
 +  if (result.updatedScenario === undefined && result.questions === undefined)
 +    throw new DecodeError(path, 'an AI response with updates or questions');
    return {
@@ -1977,14 +2100,14 @@ index b72610f..a69ad92 100644
  };
  
 diff --git a/electron/ui/src/types/ai.ts b/electron/ui/src/types/ai.ts
-index a94d6b0..153e172 100644
+index a94d6b0..41bdd77 100644
 --- a/electron/ui/src/types/ai.ts
 +++ b/electron/ui/src/types/ai.ts
 @@ -14,6 +14,7 @@ export interface AIPromptResponse {
    status: "success" | "error";
    updatedScenario?: AIPromptUpdatedScenario;
    updateNotes?: string[];
-+  questions?: string[];
++  questions?: string[];  // Follow-up questions when the assistant needs information instead of inventing values.
    errorMessage?: string;
    error?: string;
  }
