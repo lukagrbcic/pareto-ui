@@ -164,7 +164,15 @@ jobs:
         working-directory: electron/ui
         timeout-minutes: 24
         run: |
-          npx cypress run
+          # Cypress' bundled Electron GPU process segfaults at startup
+          # (exit 0xC0000005) on windows-latest images since the 20261021
+          # update, before any test runs. Chrome is preinstalled on the
+          # runner and provides the same Chromium renderer coverage.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            npx cypress run --browser chrome
+          else
+            npx cypress run
+          fi
       - name: Upload Cypress artifacts and server logs
         uses: actions/upload-artifact@v4
         if: always()
