@@ -22,9 +22,10 @@ export interface AIPromptContextValue {
   diagnosis: AIOptimizationDiagnosisResponse | null;
   updatedScenario: AIPromptUpdatedScenario | null;
   updateNotes: string[];
+  questions: string[];
   errorMessage: string | null;
   lastPrompt: string | null;
-  runPrompt: (scenarioId: string | number, prompt: string) => Promise<void>;
+  runPrompt: (scenarioId: string | number, prompt: string, validationFindings?: unknown) => Promise<void>;
   runOptimizationDiagnosis: (scenarioId: string | number, errorMessage: string) => Promise<void>;
   clearResult: () => void;
 }
@@ -59,6 +60,10 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [updatedScenario, setUpdatedScenario] = useState<AIPromptUpdatedScenario | null>(null);
   const [updateNotes, setUpdateNotes] = useState<string[]>([]);
+  const [questions, setQuestions] = useState<string[]>([]);
+  // The assistant's follow-up questions from the latest fill response. Rendered
+  // with inline answer fields in the dialog; cleared on new runs (see runRequest)
+  // so stale questions never mix with a fresh response.
   const [lastPrompt, setLastPrompt] = useState<string | null>(null);
 
   useEffect(() => {
@@ -93,6 +98,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
     kind: Exclude<AIPromptRequestKind, null>,
     id: string | number,
     text: string,
+    validationFindings?: unknown,
   ): Promise<void> => {
     if (!isAvailable || requestPending.current) return;
     requestPending.current = true;
@@ -105,22 +111,27 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
     setDiagnosis(null);
     setUpdatedScenario(null);
     setUpdateNotes([]);
+    setQuestions([]);
     setLastPrompt(text);
 
     try {
       const idNumber = parseScenarioId(id);
       setRequestScenarioId(idNumber);
       if (kind === 'data-update') {
-        const payload = await requestAIDataUpdate(port, idNumber, text);
+        const payload = await requestAIDataUpdate(port, idNumber, text, validationFindings);
         if (version !== requestVersion.current) return;
         setResponse(payload);
         if (payload.status === 'error') {
           setErrorMessage(payload.errorMessage || payload.error || 'AI request failed.');
+          // The guard can reject an unusable scenario while the response still
+          // carries valid questions; surface them for a follow-up.
+          setQuestions(payload.questions || []);
           setStatus('error');
           return;
         }
         setUpdatedScenario(payload.updatedScenario || null);
         setUpdateNotes(payload.updateNotes || []);
+        setQuestions(payload.questions || []);
       } else {
         const payload = await requestAIOptimizationDiagnosis(port, idNumber, text);
         if (version !== requestVersion.current) return;
@@ -141,8 +152,10 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
     }
   };
 
-  const runPrompt = (id: string | number, prompt: string): Promise<void> =>
-    runRequest('data-update', id, prompt);
+  // validationFindings: optional validation evidence (from "Fix with AI" or the
+  // last validation run) forwarded into the request body for grounding.
+  const runPrompt = (id: string | number, prompt: string, validationFindings?: unknown): Promise<void> =>
+    runRequest('data-update', id, prompt, validationFindings);
   const runOptimizationDiagnosis = (id: string | number, message: string): Promise<void> =>
     runRequest('optimization-diagnosis', id, message);
 
@@ -157,6 +170,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
     setDiagnosis(null);
     setUpdatedScenario(null);
     setUpdateNotes([]);
+    setQuestions([]);
     setLastPrompt(null);
   };
 
@@ -172,6 +186,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
       diagnosis,
       updatedScenario,
       updateNotes,
+      questions,
       errorMessage,
       lastPrompt,
       runPrompt,
@@ -187,6 +202,7 @@ export const AIPromptProvider: React.FC<AIPromptProviderProps> = ({ children }) 
       diagnosis,
       updatedScenario,
       updateNotes,
+      questions,
       errorMessage,
       lastPrompt,
     ],

@@ -32,9 +32,13 @@ Linux also uses session settings because its API cannot identify the selected
 secret store; later versions may remember keys when a real OS secret store is
 confirmed. The unprotected `basic_text` backend is never used.
 
-Existing environment behavior is retained: `CBORG_API_KEY` (or `OPENAI_API_KEY`
-as the existing fallback), `CBORG_BASE_URL` (default `https://api.cborg.lbl.gov`),
-and the existing `openai/gpt-5.2` model. User settings allow a different endpoint
+Environment configuration is provider-aligned: the backend checks, in order,
+`CBORG_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` (or
+`GEMINI_API_KEY`), and `OPENROUTER_API_KEY`. Whichever key is found first is
+paired with that provider's own OpenAI-compatible base URL and a default model —
+a key is never sent to a different provider's endpoint. `CBORG_BASE_URL`
+overrides the CBORG endpoint as before, and `PARETO_AI_MODEL` overrides the
+selected provider's default model. User settings allow a different endpoint
 and model without editing environment files. Restart the backend after changing
 environment variables.
 

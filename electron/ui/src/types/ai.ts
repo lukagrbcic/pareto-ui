@@ -14,6 +14,7 @@ export interface AIPromptResponse {
   status: "success" | "error";
   updatedScenario?: AIPromptUpdatedScenario;
   updateNotes?: string[];
+  questions?: string[];  // Follow-up questions when the assistant needs information instead of inventing values.
   errorMessage?: string;
   error?: string;
 }

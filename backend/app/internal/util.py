@@ -1,3 +1,4 @@
+import json
 import math
 import time
 import functools
@@ -405,8 +406,68 @@ def build_map_data_from_json(data_input):
 
     return map_data
 
-def FormatPrompt(user_prompt, data = None):
-    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON with the updated JSON scenario object. Along with the updated scenario, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. Please also provide a detailed 'updateNotes', so that I can explain to the user what was updated.\n"
+def _units_defaults_block():
+    """Units and blank-cell conventions for the scenario inputs.
+
+    Tells the model which display units the app uses (DEFAULT_UNITS) and that
+    blank cells mean "never filled" — not zero — so it must not fill blanks
+    with 0 unless the documented default for that table is actually 0.
+    """
+    return (
+        "Units and defaults: the scenario's display units are "
+        f"{json.dumps(DEFAULT_UNITS)}. Blank cells mean an input was never filled; they are not zeros, "
+        "so never fill a blank with 0 unless the documented default for that table is actually 0. "
+        "When you add or change values, state the units you assumed in updateNotes.\n"
+    )
+
+
+def _model_requirements_block(optimization_settings):
+    """The effective model parameters implied by the user's optimization settings.
+
+    Fills must be tailored to the configured model: features that are enabled
+    (water quality, hydraulics, desalination, ...) make their input tables
+    required, and objective/solver choices shape what values make sense.
+    """
+    if not optimization_settings:
+        return ""
+    try:
+        # Reuse the same settings resolution the optimizer uses, so the model
+        # sees exactly the configuration that will be built.
+        model_parameters = prepare_config({"optimization": optimization_settings},
+                                          expected_response="modelParameters")
+    except Exception:
+        return ""
+    if not isinstance(model_parameters, dict) or not model_parameters:
+        return ""
+
+    def _enabled(name, active_values=None):
+        value = str(model_parameters.get(name, "false")).lower()
+        if active_values is not None:
+            return value in active_values
+        return value not in ("false", "0", "", "none")
+
+    # water_quality/hydraulics are multi-valued in the app ("post_process" runs
+    # the model without requiring those input tables; "discrete"/"co_optimize*"
+    # build them into the optimization).
+    enabled = sorted(name for name, active in (
+        ("water_quality", _enabled("water_quality", ("true", "1", "discrete"))),
+        ("hydraulics", _enabled("hydraulics", ("true", "1", "co_optimize", "co_optimize_linearized"))),
+        ("desalination_model", _enabled("desalination_model")),
+        ("infrastructure_timing", _enabled("infrastructure_timing")),
+        ("subsurface_risk", _enabled("subsurface_risk")),
+    ) if active)
+    enabled_note = f" Enabled features: {', '.join(enabled)}." if enabled else ""
+    return (
+        "Model requirements for the current optimization settings (tailor fills to this configured "
+        f"model; tables required only under an enabled feature are required here too): "
+        f"{json.dumps(model_parameters)}.{enabled_note}\n"
+    )
+
+
+def FormatPrompt(user_prompt, data = None, optimization_settings = None, validation_findings = None):
+    from app.internal.ai.docs import prompt_reference_docs
+
+    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON. Along with the updated data, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. You may include only the sections you actually changed (for example, only 'df_sets' when adding set entries, or only the changed tables inside 'df_parameters'); the application will merge your response into the scenario and keep everything you left out unchanged. If essential information is missing (for example a node, table, or period the request depends on does not exist in the scenario, or an engineering value cannot be inferred from the provided data), do not guess or invent values: include a top-level key called 'questions' with a list of short questions, and return 'updatedScenario' only for the parts you can fill from the provided data; if you cannot make any changes, omit 'updatedScenario' and return only the questions. Please also provide 'updateNotes' as an array of short plain-text strings for the user to review. Format rules: one note per distinct change or finding; each note is a single sentence of at most 240 characters; no markdown, no line breaks inside a note, no numbered essays. The first note should summarize what you interpreted the request to mean, then add one note per changed table stating what changed and why. Do not bundle several changes into one long note. Anything that needs the user's decision belongs in 'questions', not in updateNotes.\n"
 
     if data:
         prompt_data = f"Here is the scenario: {data}\n\n"
@@ -416,13 +477,33 @@ def FormatPrompt(user_prompt, data = None):
     ## TODO:
     # Some of the input tables operate under a set of rules. For example, some tables can only use values from other tables.
     # If we can define these rules, it should improve how well this works.
-    dataset_rules = "" # f"Some rules about the dataset:\n"
+    # Core referential rules the model must follow when editing data.
+    dataset_rules = ("Dataset rules: only use identifiers (node names, periods, options) that already exist "
+                     "in the scenario's sets and tables; never delete existing tables or rows.\n")
 
-    prompt = f"{user_disclosure}{dataset_rules}{prompt_data}Here is the prompt:\n{user_prompt}"
+    # Assembled grounding blocks, injected between the response contract and
+    # the scenario JSON so they frame how the model reads the data.
+    units_defaults = _units_defaults_block()
+    model_requirements = _model_requirements_block(optimization_settings)
+
+    # Retrieved PARETO documentation chunks (user prompt + enabled features as
+    # retrieval cues). Empty string when the docs index is unavailable.
+    reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
+    reference = f"{reference_docs}\n\n" if reference_docs else ""
+
+    # Live validation findings (when handed over via "Fix with AI" or auto-
+    # attached from the last run) steer the fill toward the actual problems.
+    validation = ""
+    if validation_findings:
+        validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
+
+    prompt = f"{user_disclosure}{reference}{model_requirements}{dataset_rules}{units_defaults}{validation}{prompt_data}Here is the prompt:\n{user_prompt}"
 
     return prompt
 
-def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_context = None):
+def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_context = None, optimization_settings = None):
+    from app.internal.ai.docs import diagnosis_reference_docs
+
     user_disclosure = (
         "You are diagnosing a failed PARETO optimization run inside a desktop application. "
         "The optimization model comes from the project-pareto Python package and uses the pyomo Python package underneath. "
@@ -448,7 +529,12 @@ def FormatOptimizationDiagnosisPrompt(error_message, scenario = None, diagnosis_
 
     scenario_data = f"Scenario context:\n{scenario}\n\n" if scenario else ""
     diagnosis_data = f"Diagnosis context:\n{diagnosis_context}\n\n" if diagnosis_context else ""
-    return f"{user_disclosure}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
+    # Retrieved PARETO docs, cued by the failure message itself (plus enabled
+    # features) so solver errors get grounded explanations. Empty string
+    # without the docs index.
+    reference_docs = diagnosis_reference_docs(optimization_settings, error_message)
+    reference = f"{reference_docs}\n\n" if reference_docs else ""
+    return f"{user_disclosure}{reference}{scenario_data}{diagnosis_data}Optimization failure message:\n{error_message}"
 
 def summarize_long_text(text, start_chars=6000, end_chars=4000):
     if text is None:

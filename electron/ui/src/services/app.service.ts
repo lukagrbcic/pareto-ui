@@ -192,13 +192,15 @@ export const saveAISettings = (backend_port: number, settings: {api_key?: string
 export const resetAISettings = (backend_port: number): Promise<AIBackendSettings> =>
     requestJson(`${BACKEND_URL}:${backend_port}/ai_settings`, decodeAIBackendSettings, {method: 'DELETE'});
 
-export const requestAIDataUpdate = async (backend_port: number, id: ScenarioId, prompt: string): Promise<AIPromptResponse> => {
+export const requestAIDataUpdate = async (backend_port: number, id: ScenarioId, prompt: string, validationFindings?: unknown): Promise<AIPromptResponse> => {
     const endpoint = `${BACKEND_URL}:${backend_port}/request_ai_data_update/${scenarioId(id)}`
     return requestJson(endpoint, decodeAIPromptResponse, {
-        method: 'POST', 
+        method: 'POST',
         mode: 'cors',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({"prompt": prompt})
+        // Attach validation evidence when provided so the backend embeds it in
+        // the fill prompt; omit the key entirely for standalone prompt-only runs.
+        body: JSON.stringify(validationFindings != null ? {"prompt": prompt, "validation_findings": validationFindings} : {"prompt": prompt})
     });
 }
 

@@ -50,6 +50,7 @@ export default function Bottombar(props) {
     const [ showModalError, setShowModalError ] = useState(false)
     const [ modalError, setModalError ] = useState('')
     const [ openAIPrompt, setOpenAIPrompt ] = useState(false)
+    const [ aiValidationFindings, setAiValidationFindings ] = useState<ScenarioValidation | null>(null)
     const [ key, setKey ] =  useState(null)
     const [ hasOverride, setHasOverride ] = useState(false)
     const [ openValidationDialog, setOpenValidationDialog ] = useState(false)
@@ -61,13 +62,36 @@ export default function Bottombar(props) {
     useEffect(() => {
       setValidationResult(null); setValidationLoading(false); setValidationAdvancing(false); setValidationError(null);
       setOpenValidationDialog(false);
+      setAiValidationFindings(null);
       return () => { validationVersion.current += 1; };
+      // Clearing on scenario/revision changes keeps stale AI findings from a
+      // previous revision out of the next fill request.
     }, [id, scenario?.input_revision, props.saving, inputDataEdited]);
     const handleOpenSaveModal = () => setOpenSaveModal(true);
     const handleCloseSaveModal = () => setOpenSaveModal(false);
     const handleCloseRerunModal = () => setOpenRerunModal(false);
-    const handleOpenAIPrompt = () => setOpenAIPrompt(true);
-    const handleCloseAIPrompt = () => setOpenAIPrompt(false);
+    const handleOpenAIPrompt = () => {
+      // Ground standalone fills too: attach the latest validation findings when
+      // the dialog was not opened through "Fix with AI".
+      if (!aiValidationFindings && validationResult) {
+        setAiValidationFindings(validationResult);
+      }
+      setOpenAIPrompt(true);
+    };
+    const handleCloseAIPrompt = () => { setOpenAIPrompt(false); setAiValidationFindings(null); };
+    // "Fix with AI" in the validation dialog: hand the whole validation result
+    // to the AI dialog so the fill prompt targets the actual issues.
+    const handleFixValidationWithAI = (result: ScenarioValidation) => {
+      setOpenValidationDialog(false);
+      setAiValidationFindings(result);
+      setOpenAIPrompt(true);
+    };
+    // Close the review-apply loop: after AI updates are saved, validation
+    // re-runs automatically so the user immediately sees what remains.
+    const handleAIUpdatesApplied = () => {
+      handleCloseAIPrompt();
+      handleValidateScenario();
+    };
     const handleCloseValidationDialog = () => setOpenValidationDialog(false);
 
 
@@ -349,6 +373,10 @@ export default function Bottombar(props) {
         onClose={handleCloseAIPrompt}
         scenarioId={id}
         scenarioName={name}
+        // Findings captured from "Fix with AI" or the last validation run;
+        // onApplied re-validates after the user saves AI updates.
+        validationFindings={aiValidationFindings}
+        onApplied={handleAIUpdatesApplied}
       />}
       <ScenarioValidationDialog
         open={openValidationDialog}
@@ -360,6 +388,9 @@ export default function Bottombar(props) {
         onSelectTable={handleSelectValidationTable}
         onCheckFeasibility={() => handleValidateScenario(true)}
         onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
+        // Only offer "Fix with AI" when AI is configured, so non-AI setups see
+        // exactly main's validation dialog.
+        onAskAI={isAIAvailable ? handleFixValidationWithAI : undefined}
         onClose={handleCloseValidationDialog}
       />
     </Box>

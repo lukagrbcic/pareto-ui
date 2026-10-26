@@ -148,3 +148,4 @@ idaes-extensions/
 idaes_extensions/
 extensions/
 *_testing*
+/pareto_docs*
