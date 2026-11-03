@@ -260,6 +260,10 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       };
 
     tableKeys.forEach((tableKey) => {
+      // The AI returns a partial patch: a table absent from its response means
+      // "unchanged", not "deleted" — diffing it against {} would flag every
+      // untouched table as fully removed.
+      if (!(tableKey in nextTables)) return;
       const prevTable = currentTables[tableKey] || {};
       const nextTable = nextTables[tableKey] || {};
       if (JSON.stringify(prevTable) === JSON.stringify(nextTable)) return;
@@ -333,16 +337,21 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
 
   // df_sets changes are not tables, so the diff tab renders them as a compact
   // list — essential for set-only responses (e.g. adding a missing pad), which
-  // would otherwise look like "no differences" in the review step.
+  // would otherwise look like "no differences" in the review step. The AI
+  // response is a partial patch, so an absent df_sets section (or an absent
+  // set key) means "unchanged" — treating it as empty would flag every set
+  // entry in the scenario as removed.
   const setDiffs = useMemo(() => {
     if (!scenarioData || !aiDataInput) return [];
     const currentSets: Record<string, unknown> = (scenarioData.data_input as any)?.df_sets || {};
-    const nextSets: Record<string, unknown> = (aiDataInput as any).df_sets || {};
-    const keys = Array.from(new Set([...Object.keys(currentSets), ...Object.keys(nextSets)]));
+    const nextSets: Record<string, unknown> | undefined = (aiDataInput as any).df_sets;
+    if (!nextSets) return [];
     const diffs: Array<{ name: string; before: string[]; after: string[] }> = [];
-    keys.forEach((name) => {
+    Object.keys(nextSets).forEach((name) => {
+      const nextValue = nextSets[name];
+      if (!Array.isArray(nextValue)) return;
       const before = Array.isArray(currentSets[name]) ? (currentSets[name] as string[]) : [];
-      const after = Array.isArray(nextSets[name]) ? (nextSets[name] as string[]) : [];
+      const after = nextValue as string[];
       if (JSON.stringify(before) !== JSON.stringify(after)) diffs.push({ name, before, after });
     });
     return diffs;
