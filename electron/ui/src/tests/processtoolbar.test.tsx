@@ -75,3 +75,42 @@ test('process toolbar global revert button reflects canRevert and invokes onReve
     fireEvent.click(screen.getByRole('button', { name: /revert/i }));
     expect(onRevert).toHaveBeenCalledTimes(1);
 });
+
+test('process toolbar renders Redo and Session Change History popover', () => {
+    const onRevert = jest.fn();
+    const onRedo = jest.fn();
+    render(
+        <ProcessToolbar
+            selected={0}
+            scenario={mockScenario}
+            handleSelection={mockFunction}
+            canRevert={true}
+            revertLabel="Revert: Saved Pad Rates"
+            onRevert={onRevert}
+            canRedo={true}
+            redoLabel="Redo: AI changes (1 table, 2 cells)"
+            onRedo={onRedo}
+            undoHistory={[
+                { id: 'u1', label: 'Saved Pad Rates', source: 'user', timestamp: '2026-11-23T18:00:00Z', snapshot: {} },
+            ]}
+            redoHistory={[
+                { id: 'r1', label: 'AI changes (1 table, 2 cells)', source: 'ai', timestamp: '2026-11-23T18:01:00Z', snapshot: {} },
+            ]}
+        />
+    );
+
+    const redoBtn = screen.getByRole('button', { name: /redo/i });
+    expect(redoBtn).toBeEnabled();
+    fireEvent.click(redoBtn);
+    expect(onRedo).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: /change history/i }));
+    expect(screen.getByText('Session Change History')).toBeVisible();
+    expect(screen.getByText('Available to Redo (1)')).toBeVisible();
+    expect(screen.getByText('Saved Undo Stack (1)')).toBeVisible();
+    expect(screen.getByText('Saved Pad Rates')).toBeVisible();
+    expect(screen.getByText('AI changes (1 table, 2 cells)')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Undo latest change' }));
+    expect(onRevert).toHaveBeenCalledTimes(1);
+});

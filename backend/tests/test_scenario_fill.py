@@ -195,3 +195,8 @@ class ScenarioFillTests(unittest.TestCase):
                 self.assertEqual(flat_table(reloaded_disk['df_parameters'].get('InitialStorageLevel', {})), {})
             finally:
                 handler._db.close()
+                import logging
+                for log_handler in list(logging.getLogger().handlers):
+                    if getattr(log_handler, 'baseFilename', '').startswith(db_dir):
+                        logging.getLogger().removeHandler(log_handler)
+                        log_handler.close()

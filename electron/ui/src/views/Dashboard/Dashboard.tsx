@@ -29,9 +29,12 @@ export default function Dashboard() {
     copyAndRunOptimization, handleUpdateExcel, isSaving, saveError, inputFocus, focusInputIssue,
     startOptimization: handleRunModel, optimizationStart, isStartingOptimization, retryOptimizationStart, dismissOptimizationStart,
     undoHistory = [],
+    redoHistory = [],
     canRevertSaved = false,
+    canRedoSaved = false,
     getLatestUndoEntry,
     revertLastSavedChange,
+    redoLastRevertedChange,
     discardDraftEdits,
     markNextSaveMeta,
   } = useScenario();
@@ -43,6 +46,7 @@ export default function Dashboard() {
   const [ pendingAITable, setPendingAITable ] = useState<string | null>(null)
   const [ isApplyingAI, setIsApplyingAI ] = useState<boolean>(false)
   const [ isReverting, setIsReverting ] = useState<boolean>(false)
+  const [ isRedoing, setIsRedoing ] = useState<boolean>(false)
   const [ revalidateSignal, setRevalidateSignal ] = useState<number>(0)
   const {
     isAvailable: isAIAvailable,
@@ -233,6 +237,7 @@ export default function Dashboard() {
     isSaving ||
     isApplyingAI ||
     isReverting ||
+    isRedoing ||
     isAIRunningForScenario ||
     isStartingOptimization ||
     backgroundTasks.includes(scenario.id),
@@ -246,6 +251,33 @@ export default function Dashboard() {
       : latestUndoEntry
         ? `Revert: ${latestUndoEntry.label}`
         : 'No changes to revert';
+
+  const latestRedoEntry = redoHistory.length > 0 ? redoHistory[redoHistory.length - 1] : null;
+  const handleRedoSaved = async () => {
+    if (!scenario || isRedoing || isReverting || isApplyingAI || isSaving || inputDataEdited || aiDiff.hasStagedChanges) {
+      return;
+    }
+    setIsRedoing(true);
+    try {
+      const redone = await redoLastRevertedChange?.(scenario.id);
+      if (redone) {
+        setInputDataEdited(false);
+        if (redone.source === 'ai') {
+          appendSystemNotice?.(scenario.id, `Re-applied ${redone.label}.`);
+        }
+      }
+    } finally {
+      setIsRedoing(false);
+    }
+  };
+  const canGlobalRedo =
+    !revertBlocked && !inputDataEdited && !aiDiff.hasStagedChanges && Boolean(canRedoSaved);
+  const globalRedoLabel =
+    (inputDataEdited || aiDiff.hasStagedChanges) && latestRedoEntry
+      ? 'Resolve unsaved or staged edits before redoing'
+      : latestRedoEntry
+        ? `Redo: ${latestRedoEntry.label}`
+        : 'No reverted changes to redo';
 
   const handleRequestValidation = () => {
     handleSetSection(0);
@@ -315,6 +347,12 @@ export default function Dashboard() {
         revertLabel={globalRevertLabel}
         isReverting={isReverting}
         onRevert={handleGlobalRevert}
+        canRedo={canGlobalRedo}
+        redoLabel={globalRedoLabel}
+        isRedoing={isRedoing}
+        onRedo={handleRedoSaved}
+        undoHistory={undoHistory}
+        redoHistory={redoHistory}
         onDiscardManualEdits={handleRevertManualEdits}
       >
       </ProcessToolbar>

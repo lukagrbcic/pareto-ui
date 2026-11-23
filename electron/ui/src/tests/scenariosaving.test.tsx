@@ -283,6 +283,66 @@ test('multi-step undoHistory tracks manual and AI saves and reverts in reverse o
   expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
   expect(context.undoHistory).toHaveLength(0);
   expect(context.canRevertSaved).toBe(false);
+  expect(context.redoHistory).toHaveLength(2);
+  expect(context.canRedoSaved).toBe(true);
+
+  // Redo step 1 (table save -> back to 250) and step 2 (AI save -> back to 600)
+  let redoneUser: any;
+  const redoPromise1 = act(async () => {
+    const p = context.redoLastRevertedChange(1);
+    await waitFor(() => expect(pending).toHaveLength(4));
+    await acknowledge(3);
+    redoneUser = await p;
+  });
+  await redoPromise1;
+  expect(redoneUser?.source).toBe('user');
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(250);
+  expect(context.undoHistory).toHaveLength(1);
+  expect(context.redoHistory).toHaveLength(1);
+
+  let redoneAI: any;
+  const redoPromise2 = act(async () => {
+    const p = context.redoLastRevertedChange(1);
+    await waitFor(() => expect(pending).toHaveLength(5));
+    await acknowledge(4);
+    redoneAI = await p;
+  });
+  await redoPromise2;
+  expect(redoneAI?.source).toBe('ai');
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(600);
+  expect(context.undoHistory).toHaveLength(2);
+  expect(context.redoHistory).toHaveLength(0);
+  expect(context.canRedoSaved).toBe(false);
+
+  // Reverting once then saving a new edit clears redoHistory cleanly
+  const revertOncePromise = act(async () => {
+    const p = context.revertLastSavedChange(1);
+    await waitFor(() => expect(pending).toHaveLength(6));
+    await acknowledge(5);
+    await p;
+  });
+  await revertOncePromise;
+  expect(context.redoHistory).toHaveLength(1);
+
+  act(() => {
+    const nextSnapshot = copyScenario(context.scenarioData);
+    nextSnapshot.data_input.df_parameters.PadRates.T01[0] = 333;
+    void context.handleScenarioUpdate(nextSnapshot, false, 'json');
+  });
+  await waitFor(() => expect(pending).toHaveLength(7));
+  await acknowledge(6);
+  expect(context.redoHistory).toHaveLength(0);
+  expect(context.canRedoSaved).toBe(false);
+
+  // Revert back to 100 before testing synchronous discardDraftEdits
+  for (let i = 0; i < 2; i += 1) {
+    let p: any;
+    act(() => { p = context.revertLastSavedChange(1); });
+    await waitFor(() => expect(pending).toHaveLength(8 + i));
+    await acknowledge(7 + i);
+    await act(async () => { await p; });
+  }
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
 
   // discardDraftEdits restores the saved baseline synchronously with zero network calls
   const callsBeforeDiscard = (global.fetch as jest.Mock).mock.calls.length;

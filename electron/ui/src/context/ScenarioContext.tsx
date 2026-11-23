@@ -116,9 +116,13 @@ export interface ScenarioContextValue {
   inputFocus: ValidationIssue | null;
   focusInputIssue: (issue: ValidationIssue) => void;
   undoHistory: ScenarioUndoEntry[];
+  redoHistory: ScenarioUndoEntry[];
   canRevertSaved: boolean;
+  canRedoSaved: boolean;
   getLatestUndoEntry: (id?: string | number) => ScenarioUndoEntry | null;
+  getLatestRedoEntry: (id?: string | number) => ScenarioUndoEntry | null;
   revertLastSavedChange: (id?: string | number) => Promise<ScenarioUndoEntry | null>;
+  redoLastRevertedChange: (id?: string | number) => Promise<ScenarioUndoEntry | null>;
   discardDraftEdits: (id?: string | number) => void;
   markNextSaveMeta: (id: string | number, meta: { label: string; source: 'user' | 'ai' }) => void;
 
@@ -176,6 +180,8 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
   const navigationVersion = useRef(0);
   const [undoStacks, setUndoStacks] = useState<Record<string, ScenarioUndoEntry[]>>({});
   const undoStacksRef = useRef<Record<string, ScenarioUndoEntry[]>>({});
+  const [redoStacks, setRedoStacks] = useState<Record<string, ScenarioUndoEntry[]>>({});
+  const redoStacksRef = useRef<Record<string, ScenarioUndoEntry[]>>({});
   const nextSaveMetaRef = useRef<Record<string, { label: string; source: 'user' | 'ai' }>>({});
   const pushUndoEntry = (id: string, entry: ScenarioUndoEntry) => {
     const existing = undoStacksRef.current[id] || [];
@@ -184,12 +190,26 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     undoStacksRef.current = nextAll;
     setUndoStacks(nextAll);
   };
+  const pushRedoEntry = (id: string, entry: ScenarioUndoEntry) => {
+    const existing = redoStacksRef.current[id] || [];
+    const nextStack = [...existing, entry].slice(-MAX_UNDO_STEPS);
+    const nextAll = { ...redoStacksRef.current, [id]: nextStack };
+    redoStacksRef.current = nextAll;
+    setRedoStacks(nextAll);
+  };
   const clearUndoForScenario = (id: string) => {
     if (!undoStacksRef.current[id]) return;
     const nextAll = { ...undoStacksRef.current };
     delete nextAll[id];
     undoStacksRef.current = nextAll;
     setUndoStacks(nextAll);
+  };
+  const clearRedoForScenario = (id: string) => {
+    if (!redoStacksRef.current[id]) return;
+    const nextAll = { ...redoStacksRef.current };
+    delete nextAll[id];
+    redoStacksRef.current = nextAll;
+    setRedoStacks(nextAll);
   };
   const markNextSaveMeta = (id: string | number, meta: { label: string; source: 'user' | 'ai' }) => {
     nextSaveMetaRef.current[String(id)] = meta;
@@ -198,6 +218,12 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     const targetId = String(id ?? selectedId.current ?? '');
     if (!targetId) return null;
     const stack = undoStacksRef.current[targetId];
+    return stack && stack.length > 0 ? stack[stack.length - 1] : null;
+  };
+  const getLatestRedoEntry = (id?: string | number): ScenarioUndoEntry | null => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    if (!targetId) return null;
+    const stack = redoStacksRef.current[targetId];
     return stack && stack.length > 0 ? stack[stack.length - 1] : null;
   };
   const starts = useRef<Record<string, OptimizationStart>>({});
@@ -256,6 +282,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
       const beforeSnap = extractUndoSnapshot(prevSaved);
       const afterSnap = extractUndoSnapshot(saved);
       if (!undoSnapshotsEqual(beforeSnap, afterSnap)) {
+        clearRedoForScenario(id);
         pushUndoEntry(id, {
           id: makeUndoId(),
           label: pendingMeta?.label || inferUndoLabel(prevSaved, saved),
@@ -307,6 +334,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
           const beforeSnap = extractUndoSnapshot(prevSaved);
           const afterSnap = extractUndoSnapshot(saved);
           if (!undoSnapshotsEqual(beforeSnap, afterSnap)) {
+            clearRedoForScenario(id);
             pushUndoEntry(id, {
               id: makeUndoId(),
               label: pendingMeta?.label || options?.defaultLabel || inferUndoLabel(prevSaved, saved),
@@ -515,6 +543,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
   const handleDeleteScenario = async (index: string | number): Promise<void> => {
     const data = await deleteScenario(port, {id: index});
     clearUndoForScenario(String(index));
+    clearRedoForScenario(String(index));
     setScenarios(data.data);
     updateAppState({action: 'delete'}, index);
   };
@@ -564,16 +593,16 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     syncScenarioData();
   };
 
-  const revertLastSavedChange = async (id?: string | number): Promise<ScenarioUndoEntry | null> => {
-    const targetId = String(id ?? selectedId.current ?? '');
+  const applyHistoryEntry = async (
+    targetId: string,
+    entry: ScenarioUndoEntry,
+  ): Promise<ScenarioUndoSnapshot | null> => {
     if (!targetId || pendingSaves > 0 || failedSaves.current.has(targetId)) return null;
     if (activeTasks.current.some(task => String(task) === targetId)) return null;
     if (starts.current[targetId] && starts.current[targetId].phase !== 'rejected') return null;
-    const stack = undoStacksRef.current[targetId] || [];
-    if (!stack.length) return null;
-    const entry = stack[stack.length - 1];
     const base = drafts.current[targetId] || savedScenarios.current[targetId] || scenarios[targetId];
     if (!base) return null;
+    const previousSnapshot = extractUndoSnapshot(base);
     const restored: Scenario = {
       ...copyInputs(base),
       name: entry.snapshot.name,
@@ -621,11 +650,6 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
       { skipUndo: true },
     );
     if (!ok) return null;
-    const currentStack = undoStacksRef.current[targetId] || [];
-    const nextStack = currentStack.filter(item => item.id !== entry.id);
-    const nextAll = { ...undoStacksRef.current, [targetId]: nextStack };
-    undoStacksRef.current = nextAll;
-    setUndoStacks(nextAll);
     if (
       modelInputsChanged &&
       restored.results?.status !== 'Optimized' &&
@@ -634,6 +658,44 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     ) {
       handleSetSection(0);
     }
+    return previousSnapshot;
+  };
+
+  const revertLastSavedChange = async (id?: string | number): Promise<ScenarioUndoEntry | null> => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    const stack = undoStacksRef.current[targetId] || [];
+    if (!stack.length) return null;
+    const entry = stack[stack.length - 1];
+    const previousSnapshot = await applyHistoryEntry(targetId, entry);
+    if (!previousSnapshot) return null;
+    const currentStack = undoStacksRef.current[targetId] || [];
+    const nextStack = currentStack.filter(item => item.id !== entry.id);
+    const nextAll = { ...undoStacksRef.current, [targetId]: nextStack };
+    undoStacksRef.current = nextAll;
+    setUndoStacks(nextAll);
+    pushRedoEntry(targetId, {
+      ...entry,
+      snapshot: previousSnapshot,
+    });
+    return entry;
+  };
+
+  const redoLastRevertedChange = async (id?: string | number): Promise<ScenarioUndoEntry | null> => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    const stack = redoStacksRef.current[targetId] || [];
+    if (!stack.length) return null;
+    const entry = stack[stack.length - 1];
+    const previousSnapshot = await applyHistoryEntry(targetId, entry);
+    if (!previousSnapshot) return null;
+    const currentStack = redoStacksRef.current[targetId] || [];
+    const nextStack = currentStack.filter(item => item.id !== entry.id);
+    const nextAll = { ...redoStacksRef.current, [targetId]: nextStack };
+    redoStacksRef.current = nextAll;
+    setRedoStacks(nextAll);
+    pushUndoEntry(targetId, {
+      ...entry,
+      snapshot: previousSnapshot,
+    });
     return entry;
   };
 
@@ -820,10 +882,19 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
   }, [backgroundTasks, port]);
 
   const currentUndoHistory = scenarioData ? (undoStacks[String(scenarioData.id)] || []) : [];
+  const currentRedoHistory = scenarioData ? (redoStacks[String(scenarioData.id)] || []) : [];
   const activeLaunch = scenarioData ? optimizationStarts[String(scenarioData.id)] : undefined;
   const canRevertSaved = Boolean(
     scenarioData &&
     currentUndoHistory.length > 0 &&
+    pendingSaves === 0 &&
+    !saveError &&
+    !(activeLaunch && activeLaunch.phase !== 'rejected') &&
+    !backgroundTasks.some(task => String(task) === String(scenarioData.id)),
+  );
+  const canRedoSaved = Boolean(
+    scenarioData &&
+    currentRedoHistory.length > 0 &&
     pendingSaves === 0 &&
     !saveError &&
     !(activeLaunch && activeLaunch.phase !== 'rejected') &&
@@ -853,9 +924,13 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     inputFocus,
     focusInputIssue,
     undoHistory: currentUndoHistory,
+    redoHistory: currentRedoHistory,
     canRevertSaved,
+    canRedoSaved,
     getLatestUndoEntry,
+    getLatestRedoEntry,
     revertLastSavedChange,
+    redoLastRevertedChange,
     discardDraftEdits,
     markNextSaveMeta,
 

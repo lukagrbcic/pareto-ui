@@ -1245,19 +1245,29 @@ class ScenarioHandler:
             "outdated": False,
         }
 
+        def _apply_diagnosis():
+            target = self.scenario_list.get(int(id))
+            if target is None:
+                return
+            if (
+                scenario.get("input_revision")
+                and target.get("input_revision")
+                and target.get("input_revision") != scenario.get("input_revision")
+            ):
+                diagnosis_record["outdated"] = True
+                diagnosis_record["outdatedAt"] = self._utc_timestamp()
+                diagnosis_record["outdatedReason"] = "inputs_updated"
+            if isinstance(target.get("aiDiagnosis"), dict):
+                target["previousAIDiagnosis"] = deepcopy(target.get("aiDiagnosis"))
+            target["aiDiagnosis"] = diagnosis_record
+            self.update_scenario(target)
+
         lock = getattr(self, "_db_lock", None)
         if lock is not None:
             with lock:
-                latest = deepcopy(self.scenario_list.get(int(id), scenario))
-                if isinstance(latest.get("aiDiagnosis"), dict):
-                    latest["previousAIDiagnosis"] = latest.get("aiDiagnosis")
-                latest["aiDiagnosis"] = diagnosis_record
-                self.update_scenario(latest)
+                _apply_diagnosis()
         else:
-            if isinstance(scenario.get("aiDiagnosis"), dict):
-                scenario["previousAIDiagnosis"] = scenario.get("aiDiagnosis")
-            scenario["aiDiagnosis"] = diagnosis_record
-            self.update_scenario(scenario)
+            _apply_diagnosis()
 
         return diagnosis_record
 

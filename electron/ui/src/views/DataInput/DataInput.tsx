@@ -13,6 +13,7 @@ import NetworkDiagram from '../../components/NetworkDiagram/NetworkDiagram';
 import DataTable from '../../components/DataTable/DataTable';
 import {useScenario} from '../../context/ScenarioContext';
 import ForecastFill from '../../components/ScenarioCompletion/ForecastFill';
+import FilterListIcon from '@mui/icons-material/FilterList';
 import UndoIcon from '@mui/icons-material/Undo';
 
 export default function DataInput(props: DataInputProps) {
@@ -43,6 +44,7 @@ export default function DataInput(props: DataInputProps) {
   const prevTableLayoutRef = React.useRef<string>("")
   const cleanScenarioRef = React.useRef<Scenario>(JSON.parse(JSON.stringify(incomingScenario)))
   const [ isStagingEditLatched, setIsStagingEditLatched ] = useState<boolean>(false)
+  const [ showChangedRowsOnly, setShowChangedRowsOnly ] = useState<boolean>(false)
   const isAllColumnsSelected = columnNodesMapping.length > 0 && filteredColumnNodes.length === columnNodesMapping.length;
   const isAllRowsSelected = rowNodesMapping.length > 0 && filteredRowNodes.length === rowNodesMapping.length;
   const hasOpenCellEditor = Object.values(editDict).some(Boolean);
@@ -319,17 +321,68 @@ const handleRowFilter = (row) => {
 
   useEffect(() => {
     setIsStagingEditLatched(false);
+    setShowChangedRowsOnly(false);
   }, [category]);
+
+  useEffect(() => {
+    if (!activeTableAIDiff?.changedRowCount || activeTableAIDiff.nonTabular) {
+      setShowChangedRowsOnly(false);
+    }
+  }, [activeTableAIDiff?.changedRowCount, activeTableAIDiff?.nonTabular]);
+
+  const changedRowIndexSet = React.useMemo(() => {
+    const indices = new Set<number>();
+    if (!activeTableAIDiff?.changedCells) return indices;
+    Object.keys(activeTableAIDiff.changedCells).forEach(cellKey => {
+      const rowIdx = Number(cellKey.split(':')[0]);
+      if (Number.isInteger(rowIdx) && rowIdx >= 0) {
+        indices.add(rowIdx);
+      }
+    });
+    return indices;
+  }, [activeTableAIDiff]);
+
+  const effectiveRowNodes = React.useMemo(() => {
+    if (!showChangedRowsOnly || !activeTableAIDiff || changedRowIndexSet.size === 0) {
+      return rowNodes;
+    }
+    const next: Record<string, boolean> = {};
+    rowNodesMapping.forEach((mappingKey, idx) => {
+      const baseVisible = Object.keys(rowNodes).length === 0 ? true : Boolean(rowNodes[mappingKey]);
+      next[mappingKey] = baseVisible && changedRowIndexSet.has(idx);
+    });
+    return next;
+  }, [showChangedRowsOnly, activeTableAIDiff, changedRowIndexSet, rowNodes, rowNodesMapping]);
 
   const renderAIStagedBanner = () => {
     if (!hasAnyAIStaged) return null;
     const cellCount = activeTableAIDiff?.changedCellCount || 0;
+    const changedRowCount = activeTableAIDiff?.changedRowCount || 0;
+    const isTabularCategory = category !== 'Plots' && category !== 'Network Diagram' && category !== 'Input Summary';
     return (
       <Alert
         severity="info"
         sx={{ mx: 3, mt: 2, mb: 0, textAlign: 'left', alignItems: 'center' }}
         action={
           <Stack direction="row" spacing={1}>
+            {isTabularCategory && !activeTableAIDiff?.nonTabular && changedRowCount > 0 && (
+              <Button
+                size="small"
+                variant={showChangedRowsOnly ? 'contained' : 'outlined'}
+                aria-pressed={showChangedRowsOnly}
+                startIcon={<FilterListIcon fontSize="small" />}
+                onClick={() => setShowChangedRowsOnly(prev => !prev)}
+                sx={
+                  showChangedRowsOnly
+                    ? { backgroundColor: '#0b89b9', '&:hover': { backgroundColor: '#01678f' }, textTransform: 'none' }
+                    : { borderColor: '#01678f', color: '#015272', textTransform: 'none' }
+                }
+              >
+                {showChangedRowsOnly
+                  ? `Showing changed rows (${changedRowCount})`
+                  : `Show changed rows only (${changedRowCount})`}
+              </Button>
+            )}
             {props.onDiscardAIStaged && (
               <Button
                 size="small"
@@ -496,7 +549,7 @@ const handleRowFilter = (row) => {
               columnNodes={columnNodes}
               filteredColumnNodes={filteredColumnNodes}
               rowNodesMapping={rowNodesMapping}
-              rowNodes={rowNodes}
+              rowNodes={effectiveRowNodes}
               filteredRowNodes={filteredRowNodes}
               setShowError={setShowError}
               category={category}

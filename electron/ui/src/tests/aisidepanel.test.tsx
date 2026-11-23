@@ -774,3 +774,55 @@ test('blocks DataTable double-click editing while AI is thinking, and cleanly re
   expect(screen.queryByRole('cell', { name: /AI staged: blank/i })).not.toBeInTheDocument();
   expect(screen.getByText('Ready')).toBeVisible();
 });
+
+test('Show changed rows only filter in DataInput narrows table to AI-changed rows and auto-resets when reverted', async () => {
+  render(
+    <AIPromptProvider>
+      <InteractiveHarness initialScenario={scenarioWithTables} initialCategory="PadRates" />
+    </AIPromptProvider>,
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Open AI' }));
+  const composer = await screen.findByLabelText('Message AI Scenario Assistant');
+  fireEvent.change(composer, { target: { value: 'Set P1 T01 to 550' } });
+  fireEvent.click(screen.getByLabelText('Send AI message'));
+
+  await act(async () => {
+    requests[0].resolve(
+      okJson({
+        status: 'success',
+        reply: 'Updated P1 rate in T01 to 550.',
+        updatedScenario: {
+          df_parameters: {
+            PadRates: {
+              ProductionPads: ['P1', 'P2'],
+              T01: [550, 200],
+              T02: [150, 250],
+            },
+          },
+        },
+      }),
+    );
+  });
+
+  // Both rows P1 and P2 are visible initially
+  expect(await screen.findByText('P1')).toBeVisible();
+  expect(screen.getByText('P2')).toBeVisible();
+
+  // Click Show changed rows only (1) -> hides P2 while keeping P1 visible
+  const filterBtn = screen.getByRole('button', { name: 'Show changed rows only (1)' });
+  fireEvent.click(filterBtn);
+  expect(screen.getByRole('button', { name: 'Showing changed rows (1)' })).toHaveAttribute('aria-pressed', 'true');
+  expect(screen.getByText('P1')).toBeVisible();
+  expect(screen.queryByText('P2')).not.toBeInTheDocument();
+
+  // Toggle back -> P2 reappears
+  fireEvent.click(screen.getByRole('button', { name: 'Showing changed rows (1)' }));
+  expect(screen.getByText('P2')).toBeVisible();
+
+  // Enable filter again, then revert the sole staged cell -> filter auto-resets so all rows remain visible
+  fireEvent.click(screen.getByRole('button', { name: 'Show changed rows only (1)' }));
+  expect(screen.queryByText('P2')).not.toBeInTheDocument();
+  fireEvent.click(await screen.findByRole('button', { name: /Revert cell 0:1 to 100/i }));
+  expect(await screen.findByText('P2')).toBeVisible();
+});
