@@ -215,3 +215,98 @@ test('a delayed reload cannot discard an edit made after the request', async () 
   await acknowledge(0);
   expect(context.scenarioData.optimization.runtime).toBe(100);
 });
+
+test('multi-step undoHistory tracks manual and AI saves and reverts in reverse order, while discardDraftEdits restores baseline synchronously', async () => {
+  expect(context.canRevertSaved).toBe(false);
+  expect(context.undoHistory).toEqual([]);
+
+  // Step 1: manual table save
+  let resolveTable: (response: any) => void;
+  (global.fetch as jest.Mock).mockImplementationOnce(() => new Promise(resolve => { resolveTable = resolve; }));
+  const updatedTable = {ProductionPads: ['P1'], T01: [250]};
+  act(() => { void context.handleUpdateExcel(1, 'PadRates', updatedTable); });
+  await waitFor(() => expect(updateExcel).toHaveBeenCalledTimes(1));
+  const afterTableSave = {
+    ...copyScenario(initial),
+    input_revision: 'r-table',
+    data_input: {
+      df_sets: initial.data_input.df_sets,
+      df_parameters: {PadRates: updatedTable},
+    },
+  };
+  await act(async () => resolveTable({ok: true, json: async () => afterTableSave}));
+
+  expect(context.undoHistory).toHaveLength(1);
+  expect(context.undoHistory[0].source).toBe('user');
+  expect(context.canRevertSaved).toBe(true);
+
+  // Step 2: AI-tagged scenario save
+  act(() => {
+    context.markNextSaveMeta(1, {label: 'AI changes (1 table, 1 cell)', source: 'ai'});
+    const aiSnapshot = copyScenario(context.scenarioData);
+    aiSnapshot.data_input.df_parameters.PadRates.T01[0] = 600;
+    void context.handleScenarioUpdate(aiSnapshot, false, 'json');
+  });
+  await waitFor(() => expect(pending).toHaveLength(1));
+  await acknowledge(0);
+
+  expect(context.undoHistory).toHaveLength(2);
+  expect(context.undoHistory[1]).toMatchObject({
+    label: 'AI changes (1 table, 1 cell)',
+    source: 'ai',
+  });
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(600);
+
+  // Revert step 2 (AI save -> back to 250)
+  let revertedAI: any;
+  const revertPromise1 = act(async () => {
+    const p = context.revertLastSavedChange(1);
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await acknowledge(1);
+    revertedAI = await p;
+  });
+  await revertPromise1;
+  expect(revertedAI?.source).toBe('ai');
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(250);
+  expect(context.undoHistory).toHaveLength(1);
+
+  // Revert step 1 (table save -> back to 100)
+  let revertedUser: any;
+  const revertPromise2 = act(async () => {
+    const p = context.revertLastSavedChange(1);
+    await waitFor(() => expect(pending).toHaveLength(3));
+    await acknowledge(2);
+    revertedUser = await p;
+  });
+  await revertPromise2;
+  expect(revertedUser?.source).toBe('user');
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
+  expect(context.undoHistory).toHaveLength(0);
+  expect(context.canRevertSaved).toBe(false);
+
+  // discardDraftEdits restores the saved baseline synchronously with zero network calls
+  const callsBeforeDiscard = (global.fetch as jest.Mock).mock.calls.length;
+  act(() => {
+    context.scenarioData.data_input.df_parameters.PadRates.T01[0] = 999;
+    context.discardDraftEdits(1);
+  });
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
+  expect((global.fetch as jest.Mock).mock.calls.length).toBe(callsBeforeDiscard);
+});
+
+test('in-place draft mutations on scenarioData cannot corrupt savedScenarios when switching scenarios and re-selecting', async () => {
+  const second = {...copyScenario(initial), id: 2, name: 'Other'};
+  act(() => context.handleNewScenario(second));
+  act(() => context.handleScenarioSelection(1));
+
+  // Simulate DataTable mutating scenarioData in place without saving
+  act(() => {
+    context.scenarioData.data_input.df_parameters.PadRates.T01[0] = 777;
+  });
+
+  // Switch away and back without fetchScenarios having completed yet
+  act(() => context.handleScenarioSelection(2));
+  act(() => context.handleScenarioSelection(1));
+
+  expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
+});

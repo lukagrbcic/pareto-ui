@@ -28,6 +28,8 @@ export type {
   ScenarioId,
   ScenarioPropagation,
   OptimizationStart,
+  ScenarioUndoSnapshot,
+  ScenarioUndoEntry,
 } from './types/scenario';
 export type {
   MapUnits,
@@ -62,6 +64,8 @@ export type {
 export type {
   AIPromptUpdatedScenario,
   AIPromptResponse,
+  AIChatHistoryEntry,
+  AIChatMessage,
   AIOptimizationDiagnosisStep,
   AIOptimizationDiagnosisResponse,
   ScenarioAIDiagnosis,
@@ -106,4 +110,6 @@ export type {
   UpdateExcelRequest,
   RunModelRequest,
   FillScenarioInputsRequest,
+  CompletionCellEdit,
+  SaveCompletionCellsRequest,
 } from './types/api';

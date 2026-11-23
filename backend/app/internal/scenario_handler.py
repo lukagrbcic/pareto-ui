@@ -11,6 +11,8 @@
 # publicly and display publicly, and to permit others to do so.
 #####################################################################################################
 import logging
+import math
+import re
 import shutil
 import os
 import datetime
@@ -38,7 +40,7 @@ from app.internal.util import (
     
 from app.internal.ai.configuration import ai_configuration as cborg
 from app.internal.optimization.model_diagnostics import build_diagnosis_context, DIAGNOSTIC_LIMITATION
-from app.internal.scenarios.input_schema import input_revision, with_horizon
+from app.internal.scenarios.input_schema import dimension_count, input_revision, is_scalar_parameter, with_horizon
 from app.internal.scenarios.inputs import read_inputs, write_inputs, sync_map_fields, changed_pipe_fields, prune_removed_map_nodes, rename_map_nodes
 
 # _log = idaeslog.getLogger(__name__)
@@ -57,18 +59,28 @@ def serialized(method):
     return wrapped
 
 
+def _is_valid_ai_cell(cell):
+    """Match frontend decodeParameters cell contract: string | finite number | None (never bool)."""
+    if cell is None or isinstance(cell, str):
+        return True
+    if isinstance(cell, bool):
+        return False
+    if isinstance(cell, (int, float)):
+        return math.isfinite(cell)
+    return False
+
+
 def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     """Structural guard for AI scenario responses.
 
-    The AI may return only the sections it changed (for example only df_sets
-    when adding set entries), so an absent section means "unchanged" — the
-    save merge keeps the original. Sections that ARE present are treated as
-    the complete new version and checked against the original, because the
-    merge replaces them wholesale: a careless response must not silently drop
-    input tables or invent top-level sections. Returns (cleaned_scenario,
-    guard_notes), or (None, notes) when the response is unusable. Notes are
-    appended to the AI's updateNotes so the review dialog shows exactly what
-    the guard changed.
+    The AI returns a partial patch containing only the sections, sets, or
+    tables it changed, so absent tables in df_parameters and absent sets in
+    df_sets mean "unchanged" and are preserved by the UI merge without
+    snapshotting untouched tables. Entries that ARE present are checked for
+    structural validity (table shape, equal column lengths, cell types, and
+    key-aligned omitted columns) and top-level keys are checked against
+    original_data_input. Returns (cleaned_scenario, guard_notes), or
+    (None, notes) when the response is unusable.
     """
     notes = []
     if not isinstance(updated_scenario, dict):
@@ -81,82 +93,132 @@ def sanitize_ai_updated_scenario(original_data_input, updated_scenario):
     cleaned = deepcopy(updated_scenario)
     original = original_data_input if isinstance(original_data_input, dict) else {}
     original_params = original.get("df_parameters") or {}
+    had_proposed_entries = bool(cleaned.get("df_parameters") or cleaned.get("df_sets"))
     # df_parameters is only checked when present: a set-only change (e.g.
     # adding a CompletionsPad to df_sets) is legitimate without it.
     params = cleaned.get("df_parameters")
     if params is not None and not isinstance(params, dict):
         return None, ["The AI response included an invalid df_parameters section, so no updates were applied."]
 
-    # Step 1: when df_parameters is present, restore any original table the
-    # response dropped, so a careless regeneration cannot silently delete
-    # input data on save (the merge replaces the whole section).
     if isinstance(params, dict):
-        restored = sorted(table for table in original_params if table not in params)
-        for table in restored:
-            params[table] = deepcopy(original_params[table])
-        if restored:
-            notes.append("AI guard: the response dropped " + ", ".join(restored)
-                         + "; the original table(s) were kept.")
-
-        # Step 2: revert entries that are not table-shaped (dict of column ->
-        # list); prefer the original values over corrupting the inputs.
-        malformed = sorted(table for table, value in params.items() if not isinstance(value, dict))
-        for table in malformed:
-            if table in original_params:
-                params[table] = deepcopy(original_params[table])
-            else:
+        malformed = []
+        restored_col_tables = []
+        for table in sorted(list(params.keys())):
+            value = params[table]
+            orig_table = original_params.get(table)
+            if not isinstance(value, dict) or not value:
                 params.pop(table, None)
+                malformed.append(table)
+                continue
+            if is_scalar_parameter(table, value) or (
+                isinstance(orig_table, dict) and is_scalar_parameter(table, orig_table)
+            ):
+                if not all(_is_valid_ai_cell(c) for c in value.values()):
+                    params.pop(table, None)
+                    malformed.append(table)
+                continue
+            if any(
+                not isinstance(col_vals, list) or not all(_is_valid_ai_cell(c) for c in col_vals)
+                for col_vals in value.values()
+            ) or len({len(col_vals) for col_vals in value.values()}) > 1:
+                params.pop(table, None)
+                malformed.append(table)
+                continue
+            if isinstance(orig_table, dict) and orig_table and not is_scalar_parameter(table, orig_table):
+                dropped_cols = [
+                    col for col in orig_table if col not in value and isinstance(orig_table[col], list)
+                ]
+                if dropped_cols:
+                    orig_headers = list(orig_table.keys())
+                    idx_cols = orig_headers[:dimension_count(orig_headers)]
+                    target_len = len(next(iter(value.values())))
+                    orig_len = len(next(iter(orig_table.values())))
+                    if (
+                        orig_len == target_len
+                        and idx_cols
+                        and all(col in value for col in idx_cols)
+                    ):
+                        orig_keys = [tuple(orig_table[c][r] for c in idx_cols) for r in range(orig_len)]
+                        target_keys = [tuple(value[c][r] for c in idx_cols) for r in range(target_len)]
+                        if len(set(orig_keys)) == orig_len and set(target_keys) == set(orig_keys):
+                            orig_index_by_key = {k: idx for idx, k in enumerate(orig_keys)}
+                            merged_cols = {}
+                            for col in orig_table:
+                                if col in value:
+                                    merged_cols[col] = deepcopy(value[col])
+                                else:
+                                    merged_cols[col] = [
+                                        deepcopy(orig_table[col][orig_index_by_key[k]])
+                                        for k in target_keys
+                                    ]
+                            for col in value:
+                                if col not in merged_cols:
+                                    merged_cols[col] = deepcopy(value[col])
+                            params[table] = merged_cols
+                            restored_col_tables.append(table)
+                            continue
+                    params.pop(table, None)
+                    malformed.append(table)
+                    continue
         if malformed:
-            notes.append("AI guard: replaced malformed entries with original values for " + ", ".join(malformed) + ".")
+            notes.append("AI guard: ignored malformed table update(s) for " + ", ".join(malformed) + ".")
+        if restored_col_tables:
+            notes.append(
+                "AI guard: restored omitted column(s) from original values in "
+                + ", ".join(restored_col_tables)
+                + "."
+            )
 
-        # Step 3: adding a table can be legitimate (filling a required table
-        # that was missing), so keep it but flag it for the user to review.
+        # Adding a table can be legitimate (filling a required table that was
+        # missing), so keep it but flag it for the user to review.
         added = sorted(table for table in params if table not in original_params)
         if added:
             notes.append("AI guard: the response added new table(s) " + ", ".join(added)
                          + "; review them before saving.")
+        if not params:
+            cleaned.pop("df_parameters", None)
 
-    # Step 4: df_sets merges at ENTRY level — a present entry replaces only
-    # that set, absent entries keep the originals, so a set-only response is
-    # clean and nothing can be silently lost. (Sets are structural identifier
-    # lists; the AI never needs to delete existing set entries.)
+    # df_sets merges at ENTRY level — a present entry replaces only that set,
+    # absent entries keep the originals without snapshotting untouched sets.
     if "df_sets" in cleaned:
         original_sets = original.get("df_sets") or {}
         sets = cleaned["df_sets"]
         if not isinstance(sets, dict):
-            if "df_sets" in original:
-                cleaned["df_sets"] = deepcopy(original_sets)
-                notes.append("AI guard: replaced the malformed df_sets section with the original sets.")
-            else:
-                cleaned.pop("df_sets", None)
+            cleaned.pop("df_sets", None)
+            notes.append("AI guard: ignored malformed df_sets section.")
         else:
-            # Entry-level merge: absent entries keep the originals, silently —
-            # that is ordinary partial-response behavior, not a guard action.
-            for set_name, value in original_sets.items():
-                if set_name not in sets:
-                    sets[set_name] = deepcopy(value)
-            malformed_sets = sorted(set_name for set_name, value in sets.items() if not isinstance(value, list))
+            malformed_sets = sorted(
+                set_name
+                for set_name, value in sets.items()
+                if not isinstance(value, list) or any(not isinstance(item, str) for item in value)
+            )
             for set_name in malformed_sets:
-                if set_name in original_sets:
-                    sets[set_name] = deepcopy(original_sets[set_name])
-                else:
-                    sets.pop(set_name, None)
+                sets.pop(set_name, None)
             if malformed_sets:
-                notes.append("AI guard: replaced malformed set entries with original values for "
+                notes.append("AI guard: ignored malformed set entries for "
                              + ", ".join(malformed_sets) + ".")
             added_sets = sorted(set_name for set_name in sets if set_name not in original_sets)
             if added_sets:
                 notes.append("AI guard: the response added new set entries " + ", ".join(added_sets)
                              + "; review them before saving.")
+            if not sets:
+                cleaned.pop("df_sets", None)
 
     # Final step: drop top-level sections the AI invented (anything that was
-    # not in the original data_input, plus the two always-legitimate keys).
+    # not in the original data_input, plus the two always-legitimate keys),
+    # then silently strip read-only metadata keys so echoed/partial map_data or
+    # units cannot break frontend contract decoding.
     allowed_keys = set(original) | {"df_sets", "df_parameters"}
     removed = sorted(key for key in cleaned if key not in allowed_keys)
     for key in removed:
         cleaned.pop(key, None)
     if removed:
         notes.append("AI guard: removed unrecognized scenario section(s) " + ", ".join(removed) + ".")
+    for key in list(cleaned.keys()):
+        if key not in ("df_sets", "df_parameters"):
+            cleaned.pop(key, None)
+    if had_proposed_entries and not cleaned and notes:
+        return None, notes
     return cleaned, notes
 
 
@@ -767,14 +829,39 @@ class ScenarioHandler:
     @serialized
     def save_inputs(self, scenario):
         self.ensure_editable(scenario['id'])
-        sync_map_fields(scenario['data_input'])
+        previous = self.get_scenario(scenario['id'])
+        prev_data = previous.get('data_input') or {}
+        cur_data = scenario.get('data_input') or {}
+        saved_param_keys = set((cur_data.get('df_parameters') or {}).keys())
+
+        write_data = deepcopy(cur_data)
+        for set_name in (prev_data.get('df_sets') or {}):
+            if set_name not in (write_data.get('df_sets') or {}):
+                write_data.setdefault('df_sets', {})[set_name] = []
+        removed_params = set()
+        for param_name, param_val in (prev_data.get('df_parameters') or {}).items():
+            if is_scalar_parameter(param_name, param_val):
+                continue
+            if param_name not in saved_param_keys:
+                write_data.setdefault('df_parameters', {})[param_name] = {}
+                removed_params.add(param_name)
+
+        sync_map_fields(write_data)
         path = self.get_excelsheet_path(scenario['id'])
         with tempfile.TemporaryDirectory(dir=self.excelsheets_path) as directory:
             staged = Path(directory) / 'inputs.xlsx'
-            write_inputs(scenario['data_input'], staged, template=path)
-            scenario['data_input'] = read_inputs(staged, previous=scenario['data_input'])
+            write_inputs(write_data, staged, template=path)
+            reloaded = read_inputs(staged, previous=cur_data)
+            for param_name in removed_params:
+                tbl = (reloaded.get('df_parameters') or {}).get(param_name)
+                if isinstance(tbl, dict) and (not tbl or all(isinstance(v, list) and len(v) == 0 for v in tbl.values())):
+                    reloaded['df_parameters'].pop(param_name, None)
+            scenario['data_input'] = reloaded
             os.replace(staged, path)
-        if scenario.get('results', {}).get('status') == 'Optimized':
+        if (
+            scenario.get('results', {}).get('status') == 'Optimized'
+            and scenario.get('results', {}).get('input_revision') != input_revision(scenario)
+        ):
             scenario['results']['status'] = 'Not Optimized'
         return self.update_scenario(scenario)
 
@@ -872,122 +959,190 @@ class ScenarioHandler:
         return self._save_validation_results(scenario, result)
 
     
+    def _get_scenario_snapshot(self, id):
+        lock = getattr(self, "_db_lock", None)
+        if lock is not None:
+            with lock:
+                return deepcopy(self.scenario_list[int(id)])
+        return deepcopy(self.scenario_list[int(id)])
+
+    @staticmethod
+    def _clean_ai_questions(raw_questions):
+        if isinstance(raw_questions, list) and all(isinstance(q, str) for q in raw_questions):
+            cleaned = [q.strip() for q in raw_questions if q.strip()]
+            return cleaned or None
+        return None
+
     @time_it
-    def generate_data_with_ai(self, id, user_prompt, validation_findings=None):
+    def generate_data_with_ai(self, id, user_prompt, validation_findings=None, conversation_history=None, staged_updates=None):
         _log.info(f"generate_data_with_ai user prompt: {user_prompt}")
         try:
-
-            scenario = self.scenario_list[id]
+            scenario = self._get_scenario_snapshot(id)
             data_input = scenario.get("data_input", None)
-        except Exception as e:
+        except Exception:
             return {
-                "error": "invalid scenario"
+                "status": "error",
+                "errorMessage": "invalid scenario"
             }
         if not cborg.is_available():
             return {
-                "error": "ai_unavailable",
-                "detail": "AI client is not configured. Provide an API key to enable AI features."
+                "status": "error",
+                "errorMessage": "AI client is not configured. Provide an API key to enable AI features."
             }
         if data_input:
+            working_input = deepcopy(data_input)
+            if isinstance(staged_updates, dict) and staged_updates:
+                cleaned_staged, _ = sanitize_ai_updated_scenario(data_input, staged_updates)
+                if cleaned_staged:
+                    if isinstance(cleaned_staged.get("df_sets"), dict):
+                        working_input.setdefault("df_sets", {}).update(cleaned_staged["df_sets"])
+                    if isinstance(cleaned_staged.get("df_parameters"), dict):
+                        working_input.setdefault("df_parameters", {}).update(cleaned_staged["df_parameters"])
+
             # Assemble the grounded prompt: response contract + retrieved PARETO
             # docs + model requirements for the current settings + validation
-            # findings (when provided) + the full scenario + the user's prompt.
-            prompt = FormatPrompt(user_prompt=user_prompt, data=data_input, optimization_settings=scenario.get("optimization"), validation_findings=validation_findings)
-            # _log.info(f"full prompt: {prompt}")
-            _log.info(f"hitting cborg now")
-            # Each request is self-contained: never replay or accumulate shared
-            # client history (token growth and cross-scenario context leakage).
-            cborg.clear_history()
-            resp = cborg.prompt(prompt, add_to_history=False)
-            _log.info(f"resp: {resp}")
-            answer = self._parse_ai_json_response(resp)
-
-            ## TODO:
-            ## 1) check if the prompt response was good (resp.status)
-            ## 2) If ok, update scenario in DB
-            ## 3) We must also update the map data (need function for this) and excel sheet
-            ## 4) Optionally, we could display the updates to the user
-
-            ## sample prompt: Can you fill in completions demand with 10000 barrels in each time period
+            # findings (when provided) + the scenario (including staged edits) +
+            # conversation history + the user's prompt.
+            prompt = FormatPrompt(
+                user_prompt=user_prompt,
+                data=working_input,
+                optimization_settings=scenario.get("optimization"),
+                validation_findings=validation_findings,
+                conversation_history=conversation_history,
+            )
+            _log.info("hitting cborg now")
+            # Each request carries its own explicit per-scenario history block;
+            # never accumulate shared singleton client history across scenarios.
+            try:
+                cborg.clear_history()
+                resp = cborg.prompt(prompt, add_to_history=False)
+                _log.info(f"resp: {resp}")
+                answer = self._parse_ai_json_response(resp)
+            except RuntimeError as err:
+                return {
+                    "status": "error",
+                    "errorMessage": str(err) or "AI request failed.",
+                }
+            except Exception as err:
+                _log.error(f"unable to parse AI response: {err}")
+                return {
+                    "status": "error",
+                    "errorMessage": "Unable to parse AI response as valid JSON. Please try rephrasing your request.",
+                }
 
             status = answer.get("status")
             _log.info(f"ai response status: {status}")
+            clean_questions = self._clean_ai_questions(answer.get("questions"))
             if status == "error":
-                _log.info(f"error response from AI: {answer.get('errorMessage')}")
-                return answer
+                err_msg = (
+                    answer.get("errorMessage")
+                    or answer.get("detail")
+                    or answer.get("error")
+                )
+                if not isinstance(err_msg, str) or not err_msg.strip():
+                    err_msg = "The AI assistant could not fulfill this request."
+                else:
+                    err_msg = err_msg.strip()
+                _log.info(f"error response from AI: {err_msg}")
+                error_payload = {"status": "error", "errorMessage": err_msg}
+                if clean_questions:
+                    error_payload["questions"] = clean_questions
+                return error_payload
+
+            normalized = {"status": "success"}
+
+            reply = answer.get("reply")
+            if isinstance(reply, str) and reply.strip():
+                normalized["reply"] = reply.strip()
+            elif reply is not None:
+                _log.info(f"dropping empty or malformed AI reply: {reply!r}")
+
+            # Normalize the model's updateNotes (or updatedNotes) into a clean list of strings;
+            # drop malformed payloads (with a log) instead of failing the UI.
+            notes = answer.get("updateNotes") if "updateNotes" in answer else answer.get("updatedNotes")
+            clean_notes = None
+            if isinstance(notes, str):
+                stripped = notes.strip()
+                if stripped:
+                    clean_notes = [stripped]
+            elif isinstance(notes, list):
+                if all(isinstance(n, str) for n in notes):
+                    stripped_list = [n.strip() for n in notes if n.strip()]
+                    if stripped_list:
+                        clean_notes = stripped_list
+                else:
+                    _log.info(f"dropping malformed AI updateNotes: {notes!r}")
+            elif notes is not None:
+                _log.info(f"dropping malformed AI updateNotes: {notes!r}")
+
+            if clean_questions:
+                normalized["questions"] = clean_questions
+            elif answer.get("questions") is not None and not isinstance(answer.get("questions"), list):
+                _log.info(f"dropping malformed AI questions: {answer.get('questions')!r}")
 
             # Structural guard: the model may return only the sections it
-            # changed; check whatever it returned for dropped tables, malformed
-            # entries, and invented sections before the review/save flow. An
-            # unusable response becomes a clean error; valid questions survive
-            # the rejection.
+            # changed; check whatever it returned for malformed entries,
+            # misaligned omitted columns, and invented sections before staging.
             guard_notes = []
             updatedScenario = answer.get("updatedScenario")
             if updatedScenario is not None:
-                cleaned_scenario, guard_notes = sanitize_ai_updated_scenario(data_input, updatedScenario)
+                cleaned_scenario, guard_notes = sanitize_ai_updated_scenario(working_input, updatedScenario)
                 if cleaned_scenario is None:
                     _log.info(f"AI response failed the structural guard: {guard_notes[0]}")
                     error_response = {"status": "error", "errorMessage": guard_notes[0]}
-                    questions = answer.get("questions")
-                    if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
-                        error_response["questions"] = [q.strip() for q in questions]
+                    if clean_questions:
+                        error_response["questions"] = clean_questions
                     return error_response
-                if not cleaned_scenario:
-                    # The response changed nothing recognizable (e.g. an empty
-                    # updatedScenario); treat it as updates-free so the decoder's
-                    # updates-or-questions rule decides with the questions.
-                    answer.pop("updatedScenario", None)
-                    questions = answer.get("questions")
-                    has_questions = isinstance(questions, list) and any(
-                        isinstance(q, str) and q.strip() for q in questions)
-                    if not has_questions:
-                        return {"status": "error",
-                                "errorMessage": "The AI response did not include any scenario changes."}
-                else:
-                    answer["updatedScenario"] = cleaned_scenario
-            # Normalize the model's updateNotes into a clean list of strings;
-            # drop malformed payloads (with a log) instead of failing the UI.
-            notes = answer.get("updateNotes")
-            if isinstance(notes, str):
-                answer["updateNotes"] = [notes] if notes.strip() else []
-            elif isinstance(notes, list):
-                if all(isinstance(n, str) and n.strip() for n in notes):
-                    answer["updateNotes"] = [n for n in notes if n.strip()]
-                else:
-                    _log.info(f"dropping malformed AI updateNotes: {notes!r}")
-                    answer.pop("updateNotes", None)
-            elif notes is not None:
-                _log.info(f"dropping malformed AI updateNotes: {notes!r}")
-                answer.pop("updateNotes", None)
-            # Surface what the guard changed so the review dialog is never silent.
-            if guard_notes:
-                answer["updateNotes"] = (answer.get("updateNotes") or []) + guard_notes
-            # Same validation for the questions list (short strings only).
-            questions = answer.get("questions")
-            if questions is not None:
-                if isinstance(questions, list) and all(isinstance(q, str) and q.strip() for q in questions):
-                    answer["questions"] = [q.strip() for q in questions]
-                else:
-                    _log.info(f"dropping malformed AI questions: {questions!r}")
-                    answer.pop("questions", None)
-            return answer
+                if cleaned_scenario:
+                    normalized["updatedScenario"] = cleaned_scenario
+
+            all_notes = (clean_notes or []) + guard_notes
+            if all_notes:
+                normalized["updateNotes"] = all_notes
+
+            has_content = bool(
+                normalized.get("updatedScenario")
+                or normalized.get("questions")
+                or normalized.get("reply")
+                or normalized.get("updateNotes")
+            )
+            if not has_content:
+                return {"status": "error", "errorMessage": "The AI response did not include a reply or scenario changes."}
+            return normalized
         else:
             return {
-                "error": "unable to process request"
+                "status": "error",
+                "errorMessage": "unable to process request"
             }
 
     def _parse_ai_json_response(self, response_text):
         if isinstance(response_text, dict):
-            return response_text
+            return deepcopy(response_text)
+        if not isinstance(response_text, str) or not response_text.strip():
+            raise ValueError("Empty AI response.")
 
-        response_text = response_text.strip()
-        if response_text.startswith("```"):
-            response_text = response_text.strip("`")
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
+        text = response_text.strip()
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+            if fenced:
+                try:
+                    parsed = json.loads(fenced.group(1).strip())
+                except json.JSONDecodeError:
+                    parsed = None
+            if parsed is None:
+                start = text.find("{")
+                end = text.rfind("}")
+                if 0 <= start < end:
+                    parsed = json.loads(text[start:end + 1])
+                else:
+                    raise
 
-        return json.loads(response_text)
+        if not isinstance(parsed, dict):
+            raise ValueError("AI response must be a JSON object.")
+        return parsed
 
     def _utc_timestamp(self):
         return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
@@ -1006,7 +1161,7 @@ class ScenarioHandler:
     def generate_optimization_diagnosis_with_ai(self, id, error_message):
         _log.info(f"generate_optimization_diagnosis_with_ai for scenario {id}")
         try:
-            scenario = self.scenario_list[id]
+            scenario = self._get_scenario_snapshot(id)
         except Exception:
             return {
                 "status": "error",
@@ -1090,10 +1245,19 @@ class ScenarioHandler:
             "outdated": False,
         }
 
-        if isinstance(scenario.get("aiDiagnosis"), dict):
-            scenario["previousAIDiagnosis"] = scenario.get("aiDiagnosis")
-        scenario["aiDiagnosis"] = diagnosis_record
-        self.update_scenario(scenario)
+        lock = getattr(self, "_db_lock", None)
+        if lock is not None:
+            with lock:
+                latest = deepcopy(self.scenario_list.get(int(id), scenario))
+                if isinstance(latest.get("aiDiagnosis"), dict):
+                    latest["previousAIDiagnosis"] = latest.get("aiDiagnosis")
+                latest["aiDiagnosis"] = diagnosis_record
+                self.update_scenario(latest)
+        else:
+            if isinstance(scenario.get("aiDiagnosis"), dict):
+                scenario["previousAIDiagnosis"] = scenario.get("aiDiagnosis")
+            scenario["aiDiagnosis"] = diagnosis_record
+            self.update_scenario(scenario)
 
         return diagnosis_record
 

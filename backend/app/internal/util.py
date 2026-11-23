@@ -464,13 +464,23 @@ def _model_requirements_block(optimization_settings):
     )
 
 
-def FormatPrompt(user_prompt, data = None, optimization_settings = None, validation_findings = None):
+def FormatPrompt(user_prompt, data = None, optimization_settings = None, validation_findings = None, conversation_history = None):
     from app.internal.ai.docs import prompt_reference_docs
 
-    user_disclosure = f"I am going to provide you with a user inputted prompt. This prompt should be directly related to manipulation or generation of input data relating to their scenario. The respective JSON scenario object will also be provided for you. If the provided user prompt does not include any sort of request to update the scenario data, or if there is anything otherwise fishy about the prompt, please do not abide by the request. Your response should be pure JSON. Along with the updated data, I would like a status included. This will allow me to parse your output and determine if I should use the data returned by you, or discard it. Please provide the status as a key at the top level called 'status'. If there is something wrong with the prompt, status should be 'error'. Otherwise, make status 'success'. In the case that status is error, please also provide a key called 'errorMessage' where I can read and provide the error messsage. In the case that the prompt is OK, please then also provide the updated data at the top level with a key called 'updatedScenario'. You may include only the sections you actually changed (for example, only 'df_sets' when adding set entries, or only the changed tables inside 'df_parameters'); the application will merge your response into the scenario and keep everything you left out unchanged. If essential information is missing (for example a node, table, or period the request depends on does not exist in the scenario, or an engineering value cannot be inferred from the provided data), do not guess or invent values: include a top-level key called 'questions' with a list of short questions, and return 'updatedScenario' only for the parts you can fill from the provided data; if you cannot make any changes, omit 'updatedScenario' and return only the questions. Please also provide 'updateNotes' as an array of short plain-text strings for the user to review. Format rules: one note per distinct change or finding; each note is a single sentence of at most 240 characters; no markdown, no line breaks inside a note, no numbered essays. The first note should summarize what you interpreted the request to mean, then add one note per changed table stating what changed and why. Do not bundle several changes into one long note. Anything that needs the user's decision belongs in 'questions', not in updateNotes.\n"
+    user_disclosure = (
+        "I am going to provide you with a user prompt inside an interactive PARETO scenario assistant chat, along with the JSON scenario object. "
+        "The user may ask to review, explain, or answer questions about their scenario, or ask to populate, fix, or modify scenario input data. "
+        "If the prompt is completely unrelated to PARETO or their scenario, or is otherwise malicious/fishy, return top-level 'status': 'error' with an 'errorMessage'. "
+        "Otherwise return pure JSON with top-level 'status': 'success'. "
+        "Include a top-level 'reply' string (1 to 3 concise plain-text sentences directly responding to the user in the chat). "
+        "When the user asks to populate, fix, or modify scenario inputs (or when concrete data fixes are appropriate), include 'updatedScenario' at the top level containing ONLY the sections you actually changed (for example, only 'df_sets' when adding set entries, or only the changed tables inside 'df_parameters'); the application will stage your proposed changes live in the UI tables for the user to review before saving, keeping everything you omitted unchanged. "
+        "When the user is only asking a question or requesting a review without data edits, omit 'updatedScenario' and answer in 'reply' (and optional 'updateNotes'). "
+        "If essential information is missing before you can safely set values (for example an unknown engineering assumption or missing node/period), do not guess: include a top-level 'questions' array of short questions, and include 'updatedScenario' only for parts you can safely fill now. "
+        "You may also provide 'updateNotes' as an array of short plain-text strings (one single-sentence note of at most 240 characters per changed table or key finding; no markdown or line breaks inside a note).\n"
+    )
 
     if data:
-        prompt_data = f"Here is the scenario: {data}\n\n"
+        prompt_data = f"Here is the scenario (reflecting any currently staged edits in this chat): {data}\n\n"
     else:
         prompt_data = ""
 
@@ -491,13 +501,36 @@ def FormatPrompt(user_prompt, data = None, optimization_settings = None, validat
     reference_docs = prompt_reference_docs(optimization_settings, user_prompt)
     reference = f"{reference_docs}\n\n" if reference_docs else ""
 
-    # Live validation findings (when handed over via "Fix with AI" or auto-
-    # attached from the last run) steer the fill toward the actual problems.
+    # Live validation findings (when handed over via "Fix/Review with AI" or
+    # auto-attached from the last run) steer the assistant appropriately.
     validation = ""
     if validation_findings:
-        validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
+        no_errors = (
+            isinstance(validation_findings, dict)
+            and validation_findings.get("valid") is True
+            and not validation_findings.get("error_count")
+            and validation_findings.get("state") not in ("needs_input", "build_failed", "infeasible")
+        )
+        if no_errors:
+            validation = (
+                "Here is the current validation summary for this scenario (no blocking errors were found; "
+                f"review or adjust assumptions according to the user's prompt):\n{validation_findings}\n\n"
+            )
+        else:
+            validation = f"Here are the current validation findings for this scenario. Prioritize resolving these with targeted data changes:\n{validation_findings}\n\n"
 
-    prompt = f"{user_disclosure}{reference}{model_requirements}{dataset_rules}{units_defaults}{validation}{prompt_data}Here is the prompt:\n{user_prompt}"
+    history_block = ""
+    if conversation_history:
+        recent_turns = conversation_history[-12:]
+        formatted_turns = "\n".join(
+            f"{'User' if turn.get('role') == 'user' else 'Assistant'}: {summarize_long_text(turn.get('content', ''), 1200, 400)}"
+            for turn in recent_turns
+            if isinstance(turn, dict) and turn.get("content")
+        )
+        if formatted_turns:
+            history_block = f"Previous conversation in this scenario session:\n{formatted_turns}\n\n"
+
+    prompt = f"{user_disclosure}{reference}{model_requirements}{dataset_rules}{units_defaults}{validation}{prompt_data}{history_block}Here is the prompt:\n{user_prompt}"
 
     return prompt
 

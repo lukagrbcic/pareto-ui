@@ -1,13 +1,17 @@
 import React from 'react';
 import {useState} from 'react';
-import { Grid, Box, IconButton, Divider } from '@mui/material';
+import { Grid, Box, Button, IconButton, Divider, Tooltip } from '@mui/material';
 import InputIcon from '@mui/icons-material/Input';
 import SettingsIcon from '@mui/icons-material/Settings';
 import PieChartIcon from '@mui/icons-material/PieChart';
-import PopupModal from '../../components/PopupModal/PopupModal'
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
+import UndoIcon from '@mui/icons-material/Undo';
+import PopupModal from '../../components/PopupModal/PopupModal';
+import { useOptionalAIPrompt } from '../../context/AIPromptContext';
 
 
 export default function ProcessToolbar(props) {
+  const { isAvailable: isAIAvailable, isPanelOpen, togglePanel } = useOptionalAIPrompt();
   const { 
     handleSelection, 
     selected, 
@@ -16,7 +20,12 @@ export default function ProcessToolbar(props) {
     inputDataEdited,
     handleUpdateExcel,
     setInputDataEdited,
-    syncScenarioData
+    syncScenarioData,
+    aiStagedCount = 0,
+    canRevert = false,
+    revertLabel = 'No changes to revert',
+    isReverting = false,
+    onRevert,
   } = props
   const [ openSaveModal, setOpenSaveModal ] = useState(false)
   const [ key, setKey ] =  useState(null)
@@ -34,7 +43,11 @@ export default function ProcessToolbar(props) {
     handleCloseSaveModal()
     setInputDataEdited(false)
     handleSelection(key)
-    syncScenarioData()
+    if (props.onDiscardManualEdits) {
+      props.onDiscardManualEdits()
+    } else {
+      syncScenarioData()
+    }
   }
 
   const handleClick = (key) => {
@@ -73,7 +86,7 @@ export default function ProcessToolbar(props) {
         <p style={selected === 0 ? styles.textSelected : styles.textUnselected}>Data Input</p>
       </Grid>
       <Grid item xs={1.8}>
-        <IconButton aria-label="optimization" sx={{marginTop:'5px'}} disabled={scenario?.results?.status === "Incomplete"} style={selected === 1 ? styles.iconSelected : null} onClick={() => handleClick(1)}>
+        <IconButton aria-label="optimization" sx={{marginTop:'5px'}} disabled={scenario?.results?.status === "Incomplete" || aiStagedCount > 0} style={selected === 1 ? styles.iconSelected : null} onClick={() => handleClick(1)}>
             <SettingsIcon fontSize="large"></SettingsIcon>
         </IconButton>
         <p style={selected === 1 ? styles.textSelected : styles.textUnselected}>Optimization Setup</p>
@@ -84,8 +97,38 @@ export default function ProcessToolbar(props) {
         </IconButton>
         <p style={selected === 2 ? styles.textSelected : styles.textUnselected}>Model Results</p>
       </Grid>
-      <Grid item xs={6.6}>
-        
+      <Grid item xs={6.6} sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 1, pr: 2 }}>
+        {scenario && (
+          <Tooltip title={revertLabel}>
+            <span>
+              <Button
+                onClick={() => void onRevert?.()}
+                disabled={!canRevert || Boolean(isReverting)}
+                variant="outlined"
+                size="small"
+                startIcon={<UndoIcon />}
+                sx={{ borderColor: '#6094bc', color: '#015272' }}
+              >
+                {isReverting ? 'Reverting…' : 'Revert'}
+              </Button>
+            </span>
+          </Tooltip>
+        )}
+        {isAIAvailable && scenario && (
+          <Button
+            onClick={() => togglePanel?.({ scenarioId: scenario.id })}
+            variant={isPanelOpen ? 'contained' : 'outlined'}
+            size="small"
+            startIcon={<AutoAwesomeIcon />}
+            sx={
+              isPanelOpen
+                ? { backgroundColor: '#01678f', '&:hover': { backgroundColor: '#015272' } }
+                : { borderColor: '#01678f', color: '#01678f' }
+            }
+          >
+            {aiStagedCount > 0 ? `AI Assistant (${aiStagedCount})` : 'AI Assistant'}
+          </Button>
+        )}
       </Grid>
       <Divider aria-label="bottom_divider"></Divider>
       </Grid>

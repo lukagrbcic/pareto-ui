@@ -12,6 +12,20 @@ const STATES: Record<string, string> = {
   outdated: 'Inputs changed during the check. Validate the current scenario again.',
 };
 
+export function hasScenarioValidationErrors(result?: ScenarioValidation | null): boolean {
+  if (!result) return false;
+  const issues = result.issues || [];
+  return Boolean(
+    (result.error_count ?? 0) > 0 ||
+    issues.some(i => i.severity === 'error') ||
+    result.state === 'needs_input' ||
+    result.state === 'build_failed' ||
+    result.state === 'infeasible' ||
+    result.model_check === 'failed' ||
+    result.feasibility === 'infeasible'
+  );
+}
+
 export default function ScenarioValidationDialog({open, loading, advancing = false, error, result,
   onAdvance, onCheckFeasibility, onSelectIssue, onSelectTable, onAskAI, onClose}: {
   open: boolean; loading: boolean; advancing?: boolean; error?: string | null; result?: ScenarioValidation | null;
@@ -19,6 +33,7 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
   onSelectTable?: (table: string) => void; onAskAI?: (result: ScenarioValidation) => void; onClose: () => void;
 }) {
   const issues = result?.issues || [];
+  const hasErrors = hasScenarioValidationErrors(result);
   return <Dialog open={open} onClose={loading ? undefined : onClose} fullWidth maxWidth="md">
     <DialogTitle>Scenario Validation</DialogTitle>
     <DialogContent dividers>
@@ -37,10 +52,14 @@ export default function ScenarioValidationDialog({open, loading, advancing = fal
       </>}
     </DialogContent>
     <DialogActions>
-      {/* Fix with AI: hands the whole validation result to the AI dialog so the
-          fill targets the real issues; onAskAI is only provided when AI is
-          available, so non-AI setups never see this button. */}
-      {!loading && result && onAskAI && (issues.length > 0 || result.state === 'infeasible') && <Button onClick={() => onAskAI(result)} variant="outlined">Fix with AI</Button>}
+      {/* Hands the validation result to the AI dialog; shows "Fix with AI" only
+          when there are errors, and "Review with AI" otherwise. onAskAI is only
+          provided when AI is available, so non-AI setups never see this button. */}
+      {!loading && result && result.state !== 'outdated' && onAskAI && (
+        <Button onClick={() => onAskAI(result)} variant="outlined">
+          {hasErrors ? 'Fix with AI' : 'Review with AI'}
+        </Button>
+      )}
       {!loading && result?.valid && onCheckFeasibility && result.feasibility !== 'feasible' && <Button onClick={onCheckFeasibility} variant="outlined">Check feasibility</Button>}
       {!loading && !error && result?.valid && result.state !== 'outdated' && <Button onClick={onAdvance} disabled={advancing} variant="contained">Advance to Optimization Setup</Button>}
       <Button onClick={onClose} disabled={loading}>Close</Button>

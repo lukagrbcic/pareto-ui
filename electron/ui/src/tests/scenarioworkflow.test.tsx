@@ -8,7 +8,10 @@ jest.mock('../AppContext', () => ({useApp: () => ({port: 50011})}));
 const mockSaved = jest.fn();
 jest.mock('../context/ScenarioContext', () => ({useScenario: () => ({acceptSavedScenario: mockSaved, inputFocus: null})}));
 jest.mock('../components/AIPromptDialog/AIPromptDialog', () => () => null);
-jest.mock('../context/AIPromptContext', () => ({useAIPrompt: () => ({isAvailable: false})}));
+jest.mock('../context/AIPromptContext', () => ({
+  useAIPrompt: () => ({isAvailable: false}),
+  useOptionalAIPrompt: () => ({isAvailable: false}),
+}));
 
 const originalFetch = global.fetch;
 let consoleError: jest.SpyInstance;
@@ -104,4 +107,76 @@ test('a delayed validation result cannot act on a different selected scenario', 
   await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   expect(props.syncScenarioData).not.toHaveBeenCalled();
   expect(props.handleSelection).not.toHaveBeenCalled();
+});
+
+test('inline completion editing quick-fills defaults and batch-saves multiple cells without leaving the checklist', async () => {
+  const readinessWithFlowback = {
+    ...readiness,
+    warning_count: 2,
+    sections: [
+      {
+        id: 'forecasts',
+        title: 'Planning periods and forecasts',
+        error_count: 0,
+        warning_count: 2,
+        fillable_count: 2,
+      },
+    ],
+    issues: [
+      {
+        code: 'default_used',
+        section: 'forecasts',
+        severity: 'warning' as const,
+        table: 'FlowbackRates',
+        row: ['CP01'],
+        period: 'T01',
+        message: 'FlowbackRates: CP01 / T01 is blank. The model uses 0, following the imported Excel convention; review this assumption.',
+      },
+      {
+        code: 'default_used',
+        section: 'forecasts',
+        severity: 'warning' as const,
+        table: 'FlowbackRates',
+        row: ['CP01'],
+        period: 'T02',
+        message: 'FlowbackRates: CP01 / T02 is blank. The model uses 0, following the imported Excel convention; review this assumption.',
+      },
+    ],
+  };
+
+  const savedScenario = {
+    ...fixture,
+    input_revision: 'rev-after-inline-save',
+  };
+
+  response(readinessWithFlowback);
+  response(savedScenario);
+  const onSelect = jest.fn();
+
+  render(<ScenarioCompletion scenario={fixture} disabled={false} onSelect={onSelect} />);
+
+  // Auto-expands the section with warnings and renders inline inputs + Use 0 quick buttons
+  const useZeroT01 = await screen.findByRole('button', { name: 'Use 0 for FlowbackRates CP01 / T01' });
+  fireEvent.click(useZeroT01);
+
+  const inputT02 = screen.getByLabelText('Value for FlowbackRates CP01 / T02');
+  fireEvent.change(inputT02, { target: { value: '250' } });
+
+  const saveBtn = screen.getByRole('button', { name: 'Save 2 edits' });
+  fireEvent.click(saveBtn);
+
+  await waitFor(() => expect(mockSaved).toHaveBeenCalledWith(savedScenario));
+  expect(onSelect).not.toHaveBeenCalled();
+  expect(global.fetch).toHaveBeenNthCalledWith(
+    2,
+    'http://localhost:50011/save_completion_cells/0',
+    expect.objectContaining({ method: 'POST' }),
+  );
+  expect(JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body)).toEqual({
+    revision: readiness.revision,
+    edits: [
+      { table: 'FlowbackRates', keys: ['CP01', 'T01'], value: 0 },
+      { table: 'FlowbackRates', keys: ['CP01', 'T02'], value: 250 },
+    ],
+  });
 });

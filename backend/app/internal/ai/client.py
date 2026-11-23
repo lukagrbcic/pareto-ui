@@ -11,6 +11,7 @@ A small wrapper around the OpenAI Python client that:
 """
 
 import os
+import threading
 import time
 import json
 from typing import List, Optional, Dict, Callable, Any
@@ -99,27 +100,34 @@ class OpenAIClientWrapper:
         # chat history (list of message dicts as expected by OpenAI chat API)
         # Example: {"role": "system", "content": "..."}
         self.history: List[Dict[str, str]] = []
+        self._lock = threading.RLock()
 
     # -------------------------
     # History management
     # -------------------------
     def add_message_to_history(self, role: str, content: str) -> None:
         """Append a message to the conversation history."""
-        self.history.append({"role": role, "content": content})
+        with self._lock:
+            self.history.append({"role": role, "content": content})
 
     def clear_history(self) -> None:
         """Clear conversation history."""
-        self.history = []
+        with self._lock:
+            self.history = []
 
     def save_history(self, path: str) -> None:
         """Save history to a JSON file."""
+        with self._lock:
+            snapshot = list(self.history)
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.history, fh, ensure_ascii=False, indent=2)
+            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
 
     def load_history(self, path: str) -> None:
         """Load history from a JSON file (overwrites current history)."""
         with open(path, "r", encoding="utf-8") as fh:
-            self.history = json.load(fh)
+            loaded = json.load(fh)
+        with self._lock:
+            self.history = loaded
 
     # -------------------------
     # Model / Key helpers
@@ -202,7 +210,8 @@ class OpenAIClientWrapper:
         if messages is not None:
             request_messages = [m.copy() for m in messages]
         else:
-            request_messages = [m.copy() for m in self.history]
+            with self._lock:
+                request_messages = [m.copy() for m in self.history]
 
         if prompt is not None:
             request_messages.append({"role": "user", "content": prompt})
@@ -285,11 +294,12 @@ class OpenAIClientWrapper:
 
         # Optionally update history
         if add_to_history:
-            if prompt is not None:
-                # append the user message we sent
-                self.add_message_to_history("user", prompt)
-            # append assistant response
-            self.add_message_to_history("assistant", assistant_text)
+            with self._lock:
+                if prompt is not None:
+                    # append the user message we sent
+                    self.add_message_to_history("user", prompt)
+                # append assistant response
+                self.add_message_to_history("assistant", assistant_text)
 
         return assistant_text
 

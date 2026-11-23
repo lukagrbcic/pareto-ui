@@ -121,3 +121,20 @@ export interface OptimizationStart {
   snapshot: Scenario;
   runId: string;
 }
+
+export interface ScenarioUndoSnapshot {
+  name: string;
+  data_input: ScenarioDataInput;
+  optimization: ScenarioOptimization;
+  override_values?: ScenarioOverrides;
+  status?: ScenarioStatus | null;
+  input_revision?: string;
+}
+
+export interface ScenarioUndoEntry {
+  id: string;
+  label: string;
+  source: 'user' | 'ai';
+  timestamp: string;
+  snapshot: ScenarioUndoSnapshot;
+}

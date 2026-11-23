@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import type { DataTableProps } from '../../types';
+import type { DataTableProps, ParameterTable, Scenario } from '../../types';
 import {
+  IconButton,
   Table,
   TableBody,
   TableCell,
@@ -10,10 +11,12 @@ import {
   TextField,
   Tooltip,
 } from '@mui/material';
+import UndoIcon from '@mui/icons-material/Undo';
 import OverrideTable from '../OverrideTable/OverrideTable';
 import { CategoryNames, ParetoDictionary } from '../../util';
 import PopupModal from '../../components/PopupModal/PopupModal';
 import { default_override_values } from '../../util';
+import { formatDiffCell, getTableDimensionCount } from '../../utils/aiStaging';
 
 export default function DataTable(props: DataTableProps): JSX.Element {
   const {
@@ -117,18 +120,41 @@ export default function DataTable(props: DataTableProps): JSX.Element {
     const ind = parseInt(inds[0]); // row index
     const colName = keyIndexMapping[parseInt(inds[1])].split('::')[1];
 
-    const tempScenario = { ...scenario };
+    const currentTable = scenario.data_input.df_parameters[category] as ParameterTable;
+    const targetTable: ParameterTable = props.onStagedTableEdit
+      ? {
+          ...currentTable,
+          [colName]: Array.isArray(currentTable[colName]) ? [...currentTable[colName]] : [],
+        }
+      : currentTable;
+    const tempScenario: Scenario = props.onStagedTableEdit
+      ? {
+          ...scenario,
+          data_input: {
+            ...scenario.data_input,
+            df_parameters: {
+              ...scenario.data_input.df_parameters,
+              [category]: targetTable,
+            },
+          },
+        }
+      : { ...scenario };
     const val = (event.target as HTMLInputElement).value;
 
     if (isNaN(Number(val))) {
-      tempScenario.data_input.df_parameters[category][colName][ind] = val;
+      targetTable[colName][ind] = val;
     } else if (val === '') {
-      tempScenario.data_input.df_parameters[category][colName][ind] = val;
+      targetTable[colName][ind] = val;
     } else {
-      tempScenario.data_input.df_parameters[category][colName][ind] = Number(val);
+      targetTable[colName][ind] = Number(val);
     }
 
     setScenario && setScenario(tempScenario);
+    if (props.onStagedTableEdit) {
+      props.onStagedTableEdit(targetTable);
+    } else {
+      handleEditInput && handleEditInput(true);
+    }
   };
 
   const handleDoubleClick = (ind: number, index: number) => {
@@ -136,6 +162,7 @@ export default function DataTable(props: DataTableProps): JSX.Element {
       ind: row number, starting at 0, excluding header row
       index: column number, starting at 0
     */
+    if (props.disabled) return;
     if (['Optimized', 'Draft', 'failure', 'Not Optimized', 'Incomplete', 'Infeasible'].includes(scenario.results.status)) {
       if (index === 0) {
         setShowRowValueInput(true);
@@ -146,7 +173,9 @@ export default function DataTable(props: DataTableProps): JSX.Element {
             const tempEditDict = { ...editDict };
             tempEditDict[`${ind}:${index}`] = true;
             setEditDict(tempEditDict);
-            handleEditInput && handleEditInput(true);
+            if (!props.onStagedTableEdit) {
+              handleEditInput && handleEditInput(true);
+            }
           }
         } else {
           setShowError && setShowError(true);
@@ -162,17 +191,39 @@ export default function DataTable(props: DataTableProps): JSX.Element {
   };
 
   const handleUpdateRowValues = () => {
-    const tempScenario = { ...scenario };
+    const currentTable = scenario.data_input.df_parameters[category] as ParameterTable;
+    const targetTable: ParameterTable = props.onStagedTableEdit
+      ? (Object.fromEntries(
+          Object.entries(currentTable).map(([k, v]) => [k, Array.isArray(v) ? [...v] : v]),
+        ) as ParameterTable)
+      : currentTable;
+    const tempScenario: Scenario = props.onStagedTableEdit
+      ? {
+          ...scenario,
+          data_input: {
+            ...scenario.data_input,
+            df_parameters: {
+              ...scenario.data_input.df_parameters,
+              [category]: targetTable,
+            },
+          },
+        }
+      : { ...scenario };
 
-    Object.entries(scenario.data_input.df_parameters[category]).map(([key, value], i) => {
+    Object.entries(targetTable).map(([key, value], i) => {
       if (i > 0) {
-        if (isNaN(Number(rowValue))) value[doubleClickIndex!] = rowValue;
+        if (rowValue === '' || isNaN(Number(rowValue))) value[doubleClickIndex!] = rowValue;
         else value[doubleClickIndex!] = Number(rowValue);
       }
     });
 
-    handleEditInput && handleEditInput(true);
+    if (!props.onStagedTableEdit) {
+      handleEditInput && handleEditInput(true);
+    }
     setScenario && setScenario(tempScenario);
+    if (props.onStagedTableEdit) {
+      props.onStagedTableEdit(targetTable);
+    }
 
     setShowRowValueInput(false);
     setRowValue(0);
@@ -192,9 +243,11 @@ export default function DataTable(props: DataTableProps): JSX.Element {
   };
 
   const renderInputRow = (ind: number) => {
+    const tableObj = data[category] || {};
+    const dimCount = getTableDimensionCount(Object.keys(tableObj));
     const cells: any[] = [];
 
-    Object.entries(data[category]).forEach(([key, value]) => {
+    Object.entries(tableObj).forEach(([key, value]) => {
       cells.push(value[ind]);
       return 1;
     });
@@ -206,17 +259,39 @@ export default function DataTable(props: DataTableProps): JSX.Element {
       */
       if (index === 0 || columnNodes[columnNodesMapping[index - 1]] || Object.keys(columnNodes).length === 0) {
         if (section === 'input') {
+          const aiCellChange = props.aiTableDiff?.changedCells?.[`${ind}:${index}`];
+          const canDoubleClickEdit = !props.disabled && index > 0;
+          const tooltipTitle = editDict?.[`${ind}:${index}`]
+            ? 'Hit enter to lock value in'
+            : aiCellChange
+              ? `Saved: ${formatDiffCell(aiCellChange.before)} → AI staged: ${formatDiffCell(aiCellChange.after)}${canDoubleClickEdit ? ' (doubleclick to edit)' : ''}`
+              : canDoubleClickEdit
+                ? 'Doubleclick to edit value'
+                : '';
           return (
             <Tooltip
               key={'tooltip_' + ind + ':' + index}
-              title={editDict?.[`${ind}:${index}`] ? 'Hit enter to lock value in' : index > 0 ? 'Doubleclick to edit value' : ''}
+              title={tooltipTitle}
               arrow
             >
               <TableCell
+                data-ai-staged={aiCellChange ? 'true' : undefined}
                 data-validation-focus={props.validationFocus?.table === category && props.validationFocus?.row?.length > 0 &&
                   props.validationFocus.row.every((name: string, position: number) => data[category][Object.keys(data[category])[position]]?.[ind] === name) &&
                   (!props.validationFocus.period || Object.keys(data[category])[index] === props.validationFocus.period) ? 'true' : undefined}
-                sx={{'&[data-validation-focus="true"]': {outline: '2px solid #ed9c28', outlineOffset: '-2px', backgroundColor: '#fff8e8 !important'}}}
+                sx={{
+                  '&[data-ai-staged="true"]': {
+                    outline: '1.5px solid rgba(1, 103, 143, 0.6)',
+                    outlineOffset: '-2px',
+                    backgroundColor: 'rgba(1, 103, 143, 0.14) !important',
+                    fontWeight: 600,
+                  },
+                  '&[data-validation-focus="true"]': {
+                    outline: '2px solid #ed9c28',
+                    outlineOffset: '-2px',
+                    backgroundColor: '#fff8e8 !important',
+                  },
+                }}
                 onKeyDown={handleKeyDown}
                 onDoubleClick={() => handleDoubleClick(ind, index)}
                 key={`${ind}:${index}`}
@@ -237,10 +312,36 @@ export default function DataTable(props: DataTableProps): JSX.Element {
                       onFocus={(event) => event.target.select()}
                     />
                   )
-                ) : category === 'PadRates' || category === 'FlowbackRates' ? (
-                  value.toLocaleString('en-US', { maximumFractionDigits: 0 })
                 ) : (
-                  value.toLocaleString('en-US', { maximumFractionDigits: 2 })
+                  <>
+                    {value === null || value === undefined
+                      ? ''
+                      : category === 'PadRates' || category === 'FlowbackRates'
+                        ? value.toLocaleString('en-US', { maximumFractionDigits: 0 })
+                        : value.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                    {aiCellChange && index >= dimCount && props.onRevertStagedCell && (
+                      <IconButton
+                        size="small"
+                        disabled={Boolean(props.disabled)}
+                        aria-label={`Revert cell ${ind}:${index} to ${formatDiffCell(aiCellChange.before)}`}
+                        onClick={event => {
+                          event.stopPropagation();
+                          props.onRevertStagedCell?.(ind, index);
+                        }}
+                        onDoubleClick={event => event.stopPropagation()}
+                        sx={{
+                          p: 0.2,
+                          ml: 0.5,
+                          verticalAlign: 'middle',
+                          color: '#015272',
+                          opacity: 0.72,
+                          '&:hover': { opacity: 1, backgroundColor: 'rgba(1, 103, 143, 0.14)' },
+                        }}
+                      >
+                        <UndoIcon sx={{ fontSize: 13 }} />
+                      </IconButton>
+                    )}
+                  </>
                 )}
               </TableCell>
             </Tooltip>
@@ -269,7 +370,9 @@ export default function DataTable(props: DataTableProps): JSX.Element {
 
   const renderInputRows = () => {
     const rows: any[] = [];
-    const len = data[category][Object.keys(data[category])[0]]?.length;
+    const tableObj = data?.[category] || {};
+    const firstCol = Object.keys(tableObj)[0];
+    const len = firstCol ? (tableObj[firstCol]?.length ?? 0) : 0;
 
     for (let i = 0; i < len; i++) {
       rows.push(renderInputRow(i));
@@ -304,7 +407,7 @@ export default function DataTable(props: DataTableProps): JSX.Element {
             <Table style={{ border: '1px solid #ddd' }} size="small">
               <TableHead style={{ backgroundColor: '#6094bc', color: 'white' }}>
                 <TableRow key="headRow">
-                  {Object.entries(data[category]).map(([key, value], index) => {
+                  {Object.entries(data?.[category] || {}).map(([key, value], index) => {
                     keyIndexMapping[index] = `${index}::${key}`;
                     if (index === 0 || columnNodes[`${index}::${key}`] || Object.keys(columnNodes).length === 0) {
                       return index === 0 ? (
@@ -489,7 +592,7 @@ export default function DataTable(props: DataTableProps): JSX.Element {
             <Table style={{ border: '1px solid #ddd' }} size="small">
               <TableHead style={{ backgroundColor: '#6094bc', color: 'white' }}>
                 <TableRow key="headRow">
-                  {Object.entries(data[category]).map(([key, value], index) => {
+                  {Object.entries(data?.[category] || {}).map(([key, value], index) => {
                     keyIndexMapping[index] = `${index}::${key}`;
                     if (index === 0 || columnNodes[`${index}::${key}`] || Object.keys(columnNodes).length === 0) {
                       return index === 0 ? (

@@ -31,3 +31,14 @@ export interface FillScenarioInputsRequest {
   value: number;
   apply: boolean;
 }
+
+export interface CompletionCellEdit {
+  table: string;
+  keys: string[];
+  value: number;
+}
+
+export interface SaveCompletionCellsRequest {
+  revision: string;
+  edits: CompletionCellEdit[];
+}

@@ -4,7 +4,7 @@ import React from 'react';
 import {useEffect, useState} from 'react';
 import type { DataInputProps, Scenario } from '../../types';
 import type { SelectChangeEvent } from '@mui/material/Select';
-import { Grid, Box, FormControl, MenuItem, Select, Button, Typography } from '@mui/material';
+import { Alert, Grid, Box, FormControl, MenuItem, Select, Button, Stack, Typography } from '@mui/material';
 import CustomChart from '../../components/CustomChart/CustomChart'
 import FilterDropdown from '../../components/FilterDropdown/FilterDropdown';
 import ErrorBar from '../../components/ErrorBar/ErrorBar'
@@ -13,6 +13,7 @@ import NetworkDiagram from '../../components/NetworkDiagram/NetworkDiagram';
 import DataTable from '../../components/DataTable/DataTable';
 import {useScenario} from '../../context/ScenarioContext';
 import ForecastFill from '../../components/ScenarioCompletion/ForecastFill';
+import UndoIcon from '@mui/icons-material/Undo';
 
 export default function DataInput(props: DataInputProps) {
   const {inputFocus, isSaving} = useScenario();
@@ -38,8 +39,13 @@ export default function DataInput(props: DataInputProps) {
   const [ rowFilterSet, setRowFilterSet ] = useState<Record<string, {amt:number,checked:boolean}>>({})
   const [ plotCategory, setPlotCategory ] = useState<string>("CompletionsDemand")
   const [ showError, setShowError ] = useState<boolean>(false)
+  const isLocalStagedEditRef = React.useRef<boolean>(false)
+  const prevTableLayoutRef = React.useRef<string>("")
+  const cleanScenarioRef = React.useRef<Scenario>(JSON.parse(JSON.stringify(incomingScenario)))
+  const [ isStagingEditLatched, setIsStagingEditLatched ] = useState<boolean>(false)
   const isAllColumnsSelected = columnNodesMapping.length > 0 && filteredColumnNodes.length === columnNodesMapping.length;
   const isAllRowsSelected = rowNodesMapping.length > 0 && filteredRowNodes.length === rowNodesMapping.length;
+  const hasOpenCellEditor = Object.values(editDict).some(Boolean);
   const plotCategoryDictionary  = {
     "CompletionsDemand": "CompletionsPads",
     "PadRates": "ProductionPads",
@@ -53,6 +59,20 @@ export default function DataInput(props: DataInputProps) {
     */
     try {
       if (category !== "Plots" && category !== "Network Diagram" && category !== "Input Summary") {
+        const activeParams = incomingScenario.data_input.df_parameters;
+        const activeTable = getParameterTable(activeParams, category) || {};
+        const colKeys = Object.keys(activeTable);
+        const firstColRows = colKeys.length > 0 && Array.isArray(activeTable[colKeys[0]]) ? activeTable[colKeys[0]] : [];
+        const layoutSignature = `${incomingScenario?.id ?? ''}::${category}::${colKeys.join('|')}::${firstColRows.join('|')}`;
+
+        if (isLocalStagedEditRef.current && layoutSignature === prevTableLayoutRef.current) {
+          isLocalStagedEditRef.current = false;
+          setScenario({...incomingScenario});
+          return;
+        }
+        isLocalStagedEditRef.current = false;
+        prevTableLayoutRef.current = layoutSignature;
+
         let tempEditDict = {}
         let tempColumnNodes = {}
         let tempColumnNodesMapping = []
@@ -64,11 +84,11 @@ export default function DataInput(props: DataInputProps) {
 
         // determine unique row and column keys for row and column filter sets
         let grabbedRowList = false
-        for(let colKey of Object.keys(getParameterTable(scenario.data_input.df_parameters, category))) {
+        for(let colKey of Object.keys(getParameterTable(activeParams, category) || {})) {
 
           // first key:value pair contains all the row names
           if (!grabbedRowList) {
-            let tempRowList = getParameterTable(scenario.data_input.df_parameters, category)[colKey]
+            let tempRowList = getParameterTable(activeParams, category)[colKey]
             for (let rowKey of tempRowList) {
               if(Object.keys(tempRowFilterSet).includes(`${rowKey}`)) tempRowFilterSet[rowKey].amt = tempRowFilterSet[rowKey].amt + 1
               else tempRowFilterSet[rowKey] = {amt: 1, checked: true}
@@ -80,7 +100,7 @@ export default function DataInput(props: DataInputProps) {
         }
         
         // determing mappings between index/values and rows+columns
-        Object.entries(getParameterTable(scenario.data_input.df_parameters, category)).map( ([key, value], ind) => {
+        Object.entries(getParameterTable(activeParams, category) || {}).map( ([key, value], ind) => {
           if (ind === 0) {
             // tempRowNodesMapping = value
             value.map ((v,i) => {
@@ -92,7 +112,7 @@ export default function DataInput(props: DataInputProps) {
             tempColumnNodesMapping.push(`${ind}::${key}`)
             tempColumnNodes[`${ind}::${key}`] = true
           }
-          getParameterTable(scenario.data_input.df_parameters, category)[key].map( (value, index) => {
+          getParameterTable(activeParams, category)[key].map( (value, index) => {
             tempEditDict[`${ind}:${index}`] = false
             return 1
           })
@@ -112,8 +132,11 @@ export default function DataInput(props: DataInputProps) {
       console.error('unable to set edit dictionary: ',e)
     }
     setScenario({...incomingScenario})
+    if (!edited) {
+      cleanScenarioRef.current = JSON.parse(JSON.stringify(incomingScenario));
+    }
     
-  }, [category, props.scenario, scenario.data_input.df_parameters]);
+  }, [category, incomingScenario]);
 
   
   const handlePlotCategoryChange = (event: SelectChangeEvent<string>) =>{
@@ -124,6 +147,7 @@ export default function DataInput(props: DataInputProps) {
     //api call to save changes on backend
     const saved = await handleUpdateExcel(scenario.id, category, getParameterTable(scenario.data_input.df_parameters, category));
     if (saved === false) return;
+    cleanScenarioRef.current = JSON.parse(JSON.stringify(scenario));
     handleEditInput(false)
     let tempEditDict = {}
     Object.entries(getParameterTable(scenario.data_input.df_parameters, category)).map( ([key, value], ind) => {
@@ -135,6 +159,34 @@ export default function DataInput(props: DataInputProps) {
     })
     setEditDict(tempEditDict)
    }
+
+  const handleRevertChanges = () => {
+    const restored = JSON.parse(JSON.stringify(cleanScenarioRef.current)) as Scenario;
+    if (
+      !hasAnyAIStaged &&
+      incomingScenario?.data_input?.df_parameters?.[category] &&
+      restored.data_input?.df_parameters?.[category]
+    ) {
+      incomingScenario.data_input.df_parameters[category] = JSON.parse(
+        JSON.stringify(restored.data_input.df_parameters[category]),
+      );
+    }
+    const tempEditDict: Record<string, boolean> = {};
+    Object.entries(getParameterTable(restored.data_input.df_parameters, category) || {}).forEach(
+      ([_key, value], ind) => {
+        if (Array.isArray(value)) {
+          value.forEach((_v, index) => {
+            tempEditDict[`${ind}:${index}`] = false;
+          });
+        }
+      },
+    );
+    setIsStagingEditLatched(false);
+    setEditDict(tempEditDict);
+    setScenario(restored);
+    handleEditInput(false);
+    props.onDiscardManualEdits?.();
+  };
 
    const handleColumnFilter = (col) => {
     var tempCols
@@ -254,6 +306,61 @@ const handleRowFilter = (row) => {
     }
 }
 
+  const activeTableAIDiff = props.aiDiff?.changedTables?.[category];
+  const hasAnyAIStaged = Boolean(props.aiDiff?.hasStagedChanges);
+
+  useEffect(() => {
+    if (hasOpenCellEditor && hasAnyAIStaged) {
+      setIsStagingEditLatched(true);
+    } else if (!hasOpenCellEditor) {
+      setIsStagingEditLatched(false);
+    }
+  }, [hasOpenCellEditor, hasAnyAIStaged]);
+
+  useEffect(() => {
+    setIsStagingEditLatched(false);
+  }, [category]);
+
+  const renderAIStagedBanner = () => {
+    if (!hasAnyAIStaged) return null;
+    const cellCount = activeTableAIDiff?.changedCellCount || 0;
+    return (
+      <Alert
+        severity="info"
+        sx={{ mx: 3, mt: 2, mb: 0, textAlign: 'left', alignItems: 'center' }}
+        action={
+          <Stack direction="row" spacing={1}>
+            {props.onDiscardAIStaged && (
+              <Button
+                size="small"
+                color="inherit"
+                disabled={Boolean(props.isApplyingAI || props.isAIRunning)}
+                onClick={props.onDiscardAIStaged}
+              >
+                Discard
+              </Button>
+            )}
+            {props.onApplyAIStaged && (
+              <Button
+                size="small"
+                variant="contained"
+                disabled={Boolean(props.isApplyingAI || props.isAIRunning || edited)}
+                onClick={() => void props.onApplyAIStaged?.()}
+                sx={{ backgroundColor: '#01678f', '&:hover': { backgroundColor: '#015272' } }}
+              >
+                {props.isApplyingAI ? 'Saving…' : 'Apply AI Changes'}
+              </Button>
+            )}
+          </Stack>
+        }
+      >
+        {cellCount > 0
+          ? `${cellCount} AI-proposed cell change${cellCount === 1 ? '' : 's'} highlighted below (hover any highlighted cell to compare saved vs staged, or double-click to tweak before applying).`
+          : `Staged AI edits are ready across ${props.aiDiff?.totalChangedTables || 0} table(s). Open any highlighted tab in the left sidebar or AI panel to inspect them.`}
+      </Alert>
+    );
+  };
+
   const renderInputCategory = () => {
     try {
       /*
@@ -321,6 +428,7 @@ const handleRowFilter = (row) => {
                 scenario={scenario}
                 handleSetCategory={handleSetCategory} 
                 updateScenario={updateScenario}
+                uploadDisabled={Boolean(edited || isSaving || hasAnyAIStaged || props.isApplyingAI || props.isAIRunning)}
               />
             </Box>
           )
@@ -334,17 +442,51 @@ const handleRowFilter = (row) => {
         {['PadRates', 'CompletionsDemand', 'FlowbackRates', 'ExtWaterSourcingAvailability', 'ReuseMinimum', 'ReuseCapacity', 'DisposalOperatingCapacity'].includes(category) &&
           <ForecastFill key={`${category}-${scenario.input_revision}`} name={category} table={getParameterTable(scenario.data_input.df_parameters, category)}
             periods={scenario.data_input.df_sets.TimePeriods || []} unit={category === 'DisposalOperatingCapacity' ? 'fraction, 0–1' : scenario.data_input.display_units[category] || 'bbl/day'}
-            disabled={edited || isSaving} onSave={async table => (await handleUpdateExcel(scenario.id, category, table)) !== false} />}
+            disabled={edited || isSaving || hasAnyAIStaged || Boolean(props.isApplyingAI || props.isAIRunning)} onSave={async table => (await handleUpdateExcel(scenario.id, category, table)) !== false} />}
+        {edited && (
+          <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 1.5 }}>
+            <Button
+              size="small"
+              variant="contained"
+              disabled={isSaving}
+              onClick={handleSaveChanges}
+              sx={{ backgroundColor: '#01678f', '&:hover': { backgroundColor: '#015272' } }}
+            >
+              Save Changes
+            </Button>
+            <Button
+              size="small"
+              variant="outlined"
+              color="inherit"
+              disabled={isSaving}
+              startIcon={<UndoIcon fontSize="small" />}
+              onClick={handleRevertChanges}
+            >
+              Revert
+            </Button>
+          </Stack>
+        )}
         <Grid container>
-          <Grid item xs={0.5}>
-            <Box sx={{display: 'flex', justifyContent: 'flex-start', marginLeft:'10px'}}>
-              {edited && <h3><Button style={{color:"#0884b4"}} onClick={handleSaveChanges}><Typography noWrap>Save Changes</Typography></Button></h3> }
-            </Box>
-          </Grid>
+          <Grid item xs={0.5} />
           <Grid item xs={11}>
             <DataTable
               key={category}
+              disabled={Boolean(isSaving || props.isApplyingAI || props.isAIRunning)}
               validationFocus={inputFocus}
+              aiTableDiff={activeTableAIDiff}
+              onRevertStagedCell={
+                props.onRevertStagedCell
+                  ? (rowIdx, colIdx) => props.onRevertStagedCell?.(category, rowIdx, colIdx)
+                  : undefined
+              }
+              onStagedTableEdit={
+                (hasAnyAIStaged || isStagingEditLatched) && props.onUpdateStagedTable
+                  ? updatedTable => {
+                      isLocalStagedEditRef.current = true;
+                      props.onUpdateStagedTable?.(category, updatedTable);
+                    }
+                  : undefined
+              }
               section="input"
               editDict={editDict}
               setEditDict={setEditDict}
@@ -359,7 +501,7 @@ const handleRowFilter = (row) => {
               setShowError={setShowError}
               category={category}
               handleEditInput={handleEditInput}
-              data={props.scenario.data_input.df_parameters}
+              data={scenario.data_input.df_parameters}
             />
           </Grid>
           <Grid item xs={0.5}>
@@ -394,8 +536,11 @@ const handleRowFilter = (row) => {
       console.error("unable to render input category: ",e)
     }
 }
-  return ( 
-    renderInputCategory()
+  return (
+    <>
+      {renderAIStagedBanner()}
+      {renderInputCategory()}
+    </>
   );
 
 }

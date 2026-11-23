@@ -116,25 +116,34 @@ export const decodeAIPromptResponse: Decoder<AIPromptResponse> = (value, path) =
   if (error) return error;
   const result = object({
     status: literal('success'),
-    // updatedScenario is optional: a questions-only response (the assistant
-    // asking instead of inventing values) is a valid success.
+    reply: optional(string),
+    // updatedScenario is optional: a conversational review or questions-only
+    // response is a valid success.
     updatedScenario: optional(unknown),
     updateNotes: optional(array(string)),
     updatedNotes: optional(array(string)),
     questions: optional(array(string)),
   })(value, path);
-  // But a success must carry updates OR questions — neither is a malformed
-  // response the UI cannot act on.
-  if (result.updatedScenario === undefined && result.questions === undefined)
-    throw new DecodeError(path, 'an AI response with updates or questions');
-  return {
+  const notes = result.updateNotes ?? result.updatedNotes;
+  const trimmedReply = result.reply?.trim() || undefined;
+  if (
+    result.updatedScenario === undefined &&
+    (!result.questions || result.questions.length === 0) &&
+    trimmedReply === undefined &&
+    (!notes || notes.length === 0)
+  ) {
+    throw new DecodeError(path, 'an AI response with a reply, updates, or questions');
+  }
+  const decoded: AIPromptResponse = {
     status: 'success',
     updatedScenario: result.updatedScenario !== undefined
       ? updatedInputs(result.updatedScenario, `${path}.updatedScenario`)
       : undefined,
-    updateNotes: result.updateNotes ?? result.updatedNotes,
+    updateNotes: notes,
     questions: result.questions,
   };
+  if (trimmedReply !== undefined) decoded.reply = trimmedReply;
+  return decoded;
 };
 
 export const decodeAIOptimizationDiagnosis: Decoder<AIOptimizationDiagnosisResponse> = (

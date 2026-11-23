@@ -18,6 +18,7 @@ import {
 import AutoAwesomeIcon from "@mui/icons-material/AutoAwesome";
 import { useAIPrompt } from "../../context/AIPromptContext";
 import { useScenario } from "../../context/ScenarioContext";
+import { buildMergedSaveScenario } from "../../utils/aiStaging";
 
 interface AIPromptDialogProps {
   open: boolean;
@@ -183,13 +184,7 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
   // re-runs validation).
   const handleSaveUpdates = async (): Promise<void> => {
     if (!scenarioData || !updatedScenario) return;
-    const mergedScenario = {
-      ...scenarioData,
-      data_input: {
-        ...scenarioData.data_input,
-        ...aiDataInput,
-      },
-    };
+    const mergedScenario = buildMergedSaveScenario(scenarioData, updatedScenario);
     const saved = await handleScenarioUpdate(mergedScenario, false, "json");
     if (saved) onApplied?.();
   };
@@ -393,7 +388,11 @@ export default function AIPromptDialog(props: AIPromptDialogProps): JSX.Element 
       <DialogContent sx={{ pt: 1 }}>
         {validationFindings != null && (
           <Alert severity="info" sx={{ mb: 1 }}>
-            The current validation findings will be shared with the AI so it can target them.
+            {typeof validationFindings === "object" &&
+            (validationFindings as Record<string, unknown>).valid === true &&
+            !(validationFindings as Record<string, unknown>).error_count
+              ? "The current validation summary will be shared with the AI for review."
+              : "The current validation findings will be shared with the AI so it can target them."}
           </Alert>
         )}
         <TextField

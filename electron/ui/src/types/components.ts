@@ -87,6 +87,8 @@ export interface DataTableProps {
   handleEditInput?: (edited: boolean) => void;
   setShowError?: (b: boolean) => void;
   deltaDictionary?: any;
+  disabled?: boolean;
+  onRevertStagedCell?: (rowIdx: number, colIdx: number) => void;
 
   [key: string]: any;
 }
@@ -100,6 +102,14 @@ export interface DataInputProps {
   handleUpdateExcel: (id: string | number, tableKey: string, updatedTable: ParameterTable) => void | Promise<boolean>;
   handleEditInput: (edited: boolean) => void;
   edited: boolean;
+  aiDiff?: import('../utils/aiStaging').ScenarioAIDiff;
+  isApplyingAI?: boolean;
+  isAIRunning?: boolean;
+  onApplyAIStaged?: () => Promise<void>;
+  onDiscardAIStaged?: () => void;
+  onUpdateStagedTable?: (tableKey: string, updatedTable: ParameterTable) => void;
+  onDiscardManualEdits?: () => void;
+  onRevertStagedCell?: (tableKey: string, rowIdx: number, colIdx: number) => void;
 }
 
 export interface FilterDropdownProps {
@@ -209,6 +219,7 @@ export interface SidebarProps {
   handleUpdateExcel?: (id: string | number, tableKey: string, updatedTable: ParameterTable) => void | Promise<boolean>;
   setInputDataEdited?: (b: boolean) => void;
   syncScenarioData?: (id?: string | number) => void;
+  onDiscardManualEdits?: () => void;
   [key: string]: any;
 }
 
@@ -298,6 +309,7 @@ export interface InputSummaryProps {
   flowbackRates: ParameterTable;
   updateScenario: (updatedScenario: Scenario) => void;
   handleSetCategory: (category: string) => void;
+  uploadDisabled?: boolean;
   [key: string]: any;
 }
 

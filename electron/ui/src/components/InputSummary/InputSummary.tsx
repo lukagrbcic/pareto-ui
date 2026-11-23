@@ -176,7 +176,10 @@ export default function InputSummary(props: InputSummaryProps) {
         setTableType(event.target.value as string)
     }
 
+    const isUploadDisabled = Boolean(disableUpload || props.uploadDisabled);
+
     const handleReplaceExcel = async (file: File) => {
+        if (isUploadDisabled) return;
         setDisableUpload(true)
         const formData = new FormData();
         formData.append('file', file, file.name);
@@ -202,7 +205,7 @@ export default function InputSummary(props: InputSummaryProps) {
         return (
             <>
                 <Box sx={styles.inputFileTextBox}>
-                    <Button variant="outlined" sx={styles.uploadInput} disabled={disableUpload}>Upload PARETO input file</Button>
+                    <Button variant="outlined" sx={styles.uploadInput} disabled={isUploadDisabled}>Upload PARETO input file</Button>
                 </Box>
                 <Box sx={{display: 'flex'}}>
                     <p style={{marginBottom:0, paddingTop:0}}>{updatedExcelFile === null ? "" : updatedExcelFile.name}</p>
@@ -218,7 +221,7 @@ export default function InputSummary(props: InputSummaryProps) {
                 };
         return (
           <FileUploader 
-            disabled={disableUpload}
+            disabled={isUploadDisabled}
             handleChange={handleChange} 
             name="file" 
             types={fileTypes}

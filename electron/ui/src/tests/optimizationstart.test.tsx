@@ -1,6 +1,6 @@
 import {act, fireEvent, render, screen, waitFor} from '@testing-library/react';
 import {ScenarioProvider, useScenario, ScenarioContextValue} from '../context/ScenarioContext';
-import {checkTasks, copyScenario, fetchScenario, fetchScenarios, runModel} from '../services/app.service';
+import {checkTasks, copyScenario, fetchScenario, fetchScenarios, runModel, updateScenario} from '../services/app.service';
 import {copyScenario as clone} from '../scenarioEdits';
 import Dashboard from '../views/Dashboard/Dashboard';
 
@@ -36,10 +36,16 @@ beforeEach(async () => {
   (fetchScenario as jest.Mock).mockImplementation(service.fetchScenario);
   (runModel as jest.Mock).mockImplementation(service.runModel);
   (copyScenario as jest.Mock).mockImplementation(service.copyScenario);
+  (updateScenario as jest.Mock).mockImplementation(service.updateScenario);
   global.fetch = jest.fn((url, options) => {
     if (String(url).endsWith('/check_tasks/')) return Promise.resolve({ok: true, status: 200, json: async () => ({tasks: []})});
     if (String(url).includes('/get_scenario/')) return Promise.resolve({ok: true, status: 200,
       json: async () => clone(database[String(url).split('/').pop()])});
+    if (String(url).endsWith('/update')) {
+      const sent = JSON.parse(options.body).updatedScenario;
+      database[sent.id] = {...clone(sent), input_revision: 'reverted-rev'};
+      return Promise.resolve({ok: true, status: 200, json: async () => ({data: clone(database[sent.id])})});
+    }
     if (String(url).endsWith('/run_model')) return new Promise((resolve, reject) => {
       requests.push({body: JSON.parse(options.body), resolve, reject});
     });
@@ -269,4 +275,59 @@ test('malformed task responses cannot release an active optimization', async () 
     await act(async () => {jest.advanceTimersByTime(2000);});
     expect(context.backgroundTasks).toEqual([]);
   } finally {consoleError.mockRestore(); jest.useRealTimers();}
+});
+
+test('undo history survives optimization completion and reverts back to original pre-edit Draft state', async () => {
+  jest.useFakeTimers();
+  try {
+    // Load a fresh Draft scenario (id 2) with initial input data, then edit & save it
+    const original = {
+      ...clone(database[1]),
+      id: 2,
+      name: 'Post-opt revert test',
+      input_revision: 'rev-orig',
+      results: {status: 'Draft', data: {}},
+      data_input: {df_sets: {ProductionPads: ['P1']}, df_parameters: {PadRates: {ProductionPads: ['P1'], T01: [100]}}},
+    };
+    database[2] = clone(original);
+    act(() => {
+      context.handleNewScenario(clone(original));
+    });
+    expect(context.undoHistory).toHaveLength(0);
+    const edited = clone(context.scenarioData);
+    edited.data_input.df_parameters.PadRates.T01[0] = 550;
+    await act(async () => { await context.handleScenarioUpdate(edited, false, 'json'); });
+    expect(context.undoHistory).toHaveLength(1);
+    expect(context.canRevertSaved).toBe(true);
+
+    // Run optimization on the edited scenario
+    act(() => { context.handleSetSection(1); });
+    fireEvent.click(screen.getByText('Optimize setup'));
+    await acknowledge();
+    expect(context.canRevertSaved).toBe(false);
+    expect(context.undoHistory).toHaveLength(1);
+
+    // Complete optimization with Optimized status & input_revision matching edited scenario
+    database[2].results = {
+      status: 'Optimized',
+      data: {v_F_Overview_dict: [['KPI', 'Units', 'Value'], ['Cost', 'USD', 100]]},
+      input_revision: database[2].input_revision,
+    };
+    await act(async () => { jest.advanceTimersByTime(2000); });
+    expect(context.backgroundTasks).toEqual([]);
+    expect(context.scenarioData.results.status).toBe('Optimized');
+    expect(context.canRevertSaved).toBe(true);
+    expect(context.section).toBe(2);
+
+    // Revert right from Model Results -> restores original data, resets results to Draft, and switches to Data Input
+    let reverted: any;
+    await act(async () => { reverted = await context.revertLastSavedChange(2); });
+    expect(reverted).not.toBeNull();
+    expect(context.scenarioData.data_input.df_parameters.PadRates.T01[0]).toBe(100);
+    expect(context.scenarioData.results.status).toBe('Draft');
+    expect(context.scenarioData.results.data).toEqual({});
+    expect(context.section).toBe(0);
+    expect(context.undoHistory).toHaveLength(0);
+    expect(context.canRevertSaved).toBe(false);
+  } finally { jest.useRealTimers(); }
 });

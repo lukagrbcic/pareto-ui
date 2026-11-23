@@ -124,6 +124,21 @@ def fill_scenario_inputs(scenario_id: int, payload: dict = Body(...)):
             raise HTTPException(400, detail=str(error)) from error
 
 
+@router.post('/save_completion_cells/{scenario_id}')
+def save_completion_cells(scenario_id: int, payload: dict = Body(...)):
+    from app.internal.scenarios.fill import apply_cell_edits
+    with scenario_handler._db_lock:
+        scenario_handler.ensure_editable(scenario_id)
+        current = scenario_handler.get_scenario(scenario_id)
+        if payload.get('revision') != current['input_revision']:
+            raise HTTPException(409, detail='Inputs changed. Refresh completion before saving edits.')
+        try:
+            updated = apply_cell_edits(current, payload.get('edits'))
+            return scenario_handler.save_inputs(updated)
+        except ValueError as error:
+            raise HTTPException(400, detail=str(error)) from error
+
+
 @router.post("/advance_to_optimization_setup/{scenario_id}")
 async def advance_to_optimization_setup(scenario_id: int):
     """
@@ -524,7 +539,7 @@ async def generate_report(id: str):
 
 
 @router.post("/request_ai_data_update/{id}")
-async def request_ai_data_update(request: Request, id: int) -> dict:
+def request_ai_data_update(id: int, req: dict = Body(default=None)) -> dict:
     """Prompt AI to fill out data.
     TODO: 
         - In the future, we should add authentication to this endpoint.
@@ -540,23 +555,45 @@ async def request_ai_data_update(request: Request, id: int) -> dict:
     Returns:
         Updated scenario
     """
-    req = await request.json()
+    if not isinstance(req, dict):
+        raise HTTPException(400, detail="Request body must be a JSON object.")
     prompt = req.get("prompt", None)
-    # Optional validation evidence from the UI ("Fix with AI" or the last
-    # validation run); embedded into the prompt so the fill targets real issues.
+    # Optional validation evidence from the UI ("Fix/Review with AI" or the last
+    # validation run); embedded into the prompt for grounding.
     validation_findings = req.get("validation_findings", None)
     if validation_findings is not None and not isinstance(validation_findings, (list, dict)):
         raise HTTPException(400, detail="validation_findings must be a list or object.")
+    conversation_history = req.get("conversation_history", None)
+    if conversation_history is not None:
+        if not isinstance(conversation_history, list) or any(
+            not isinstance(item, dict)
+            or item.get("role") not in ("user", "assistant")
+            or not isinstance(item.get("content"), str)
+            for item in conversation_history
+        ):
+            raise HTTPException(400, detail="conversation_history must be a list of user/assistant message objects.")
+    staged_updates = req.get("staged_updates", None)
+    if staged_updates is not None and not isinstance(staged_updates, dict):
+        raise HTTPException(400, detail="staged_updates must be an object.")
     if prompt:
-        updatedScenario = scenario_handler.generate_data_with_ai(id, prompt, validation_findings)
+        updatedScenario = scenario_handler.generate_data_with_ai(
+            id,
+            prompt,
+            validation_findings=validation_findings,
+            conversation_history=conversation_history,
+            staged_updates=staged_updates,
+        )
     else:
         raise HTTPException(400, detail=f"Please provide a prompt.")
     return updatedScenario
 
 @router.post("/request_ai_optimization_diagnosis/{id}")
-async def request_ai_optimization_diagnosis(request: Request, id: int) -> dict:
+def request_ai_optimization_diagnosis(id: int, req: dict = Body(default=None)) -> dict:
     """Prompt AI to diagnose a failed optimization run using scenario context."""
-    req = await request.json()
+    if req is None:
+        req = {}
+    if not isinstance(req, dict):
+        raise HTTPException(400, detail="Request body must be a JSON object.")
     error_message = req.get("errorMessage", None)
     if error_message is not None and not isinstance(error_message, str):
         raise HTTPException(400, detail="errorMessage must be a string.")

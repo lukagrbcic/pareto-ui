@@ -12,11 +12,30 @@ export interface AIPromptUpdatedScenario {
 
 export interface AIPromptResponse {
   status: "success" | "error";
+  reply?: string;
   updatedScenario?: AIPromptUpdatedScenario;
   updateNotes?: string[];
   questions?: string[];  // Follow-up questions when the assistant needs information instead of inventing values.
   errorMessage?: string;
   error?: string;
+}
+
+export interface AIChatHistoryEntry {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AIChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  status?: "success" | "error" | "applied";
+  undoEntryId?: string;
+  updateNotes?: string[];
+  questions?: string[];
+  changedTables?: Array<{ name: string; cellCount: number }>;
+  changedSets?: string[];
+  timestamp: string;
 }
 
 export interface AIOptimizationDiagnosisStep {

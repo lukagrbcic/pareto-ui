@@ -128,6 +128,8 @@ def write_inputs(data, path, template=None):
                 # Serialize metadata even for a new validation/run workbook;
                 # skipping it would silently substitute the model's defaults.
                 table = {'INDEX': list(table), 'VALUE': list(table.values())}
+            if isinstance(table, dict) and not table and name not in wb:
+                continue
             ws = wb[name] if name in wb else wb.create_sheet(name)
             for row in ws.iter_rows(min_row=2):
                 for cell in row:

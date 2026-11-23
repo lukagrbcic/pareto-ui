@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { AIPromptProvider, useAIPrompt, AIPromptContextValue } from '../context/AIPromptContext';
 import AIPromptDialog from '../components/AIPromptDialog/AIPromptDialog';
+import { buildMergedSaveScenario } from '../utils/aiStaging';
 import fixture from './fixtures/scenario-contract.json';
 
 jest.mock('../AppContext', () => ({ useApp: () => ({ port: 50011 }) }));
@@ -88,9 +89,13 @@ test('scenario zero can request, review and explicitly save checked fill inputs'
   expect(screen.getByText('Filled rates.')).toBeVisible();
   fireEvent.click(screen.getByRole('button', { name: 'Save Updates' }));
   expect(mockSave).toHaveBeenCalledWith(
-    { ...fixture, data_input: { ...fixture.data_input, ...filled.updatedScenario } },
+    buildMergedSaveScenario(fixture as any, filled.updatedScenario),
     false,
     'json',
+  );
+  const savedPayload = mockSave.mock.calls[0][0];
+  expect(savedPayload.data_input.df_parameters.InitialDisposalCapacity).toEqual(
+    fixture.data_input.df_parameters.InitialDisposalCapacity,
   );
 });
 

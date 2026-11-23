@@ -4,7 +4,7 @@ import unittest
 
 from scenario_fixtures import simple_scenario
 from app.internal.scenarios.input_schema import flat_table, with_horizon
-from app.internal.scenarios.fill import prepare_fill
+from app.internal.scenarios.fill import apply_cell_edits, prepare_fill
 from app.internal.scenarios.inputs import read_inputs, write_inputs
 from app.internal.validation.scenario_validation import validate_inputs
 
@@ -90,3 +90,108 @@ class ScenarioFillTests(unittest.TestCase):
         self.assertEqual(table, {'StorageSites': ['S1'], 'VALUE': [0]})
         write_inputs(filled['data_input'], self.path)
         self.assertEqual(read_inputs(self.path)['df_parameters']['InitialStorageLevel'], table)
+
+    def test_apply_cell_edits_saves_distinct_inline_values_across_tables_and_checks_bounds(self):
+        scenario = deepcopy(self.example)
+        data = scenario['data_input']
+        data['df_sets']['CompletionsPads'] = ['CP01']
+        data['df_parameters']['FlowbackRates'] = {}
+        data['df_parameters']['CompletionsDemand'] = {'CompletionsPads': ['CP01'], 'T01': [50], 'T02': [50]}
+        data['df_parameters']['Economics'] = {}
+
+        updated = apply_cell_edits(scenario, [
+            {'table': 'FlowbackRates', 'keys': ['CP01', 'T01'], 'value': 0},
+            {'table': 'FlowbackRates', 'keys': ['CP01', 'T02'], 'value': 250.5},
+            {'table': 'Economics', 'keys': ['discount_rate'], 'value': 0.05},
+        ])
+        params = updated['data_input']['df_parameters']
+        self.assertEqual(flat_table(params['FlowbackRates']), {('CP01', 'T01'): 0, ('CP01', 'T02'): 250.5})
+        self.assertEqual(flat_table(params['Economics'])[('discount_rate',)], 0.05)
+
+        with self.assertRaisesRegex(ValueError, 'at least 0'):
+            apply_cell_edits(scenario, [{'table': 'FlowbackRates', 'keys': ['CP01', 'T01'], 'value': -5}])
+
+        with self.assertRaisesRegex(ValueError, 'between 0 and 1'):
+            apply_cell_edits(scenario, [{'table': 'DisposalOperatingCapacity', 'keys': ['K1', 'T01'], 'value': 1.5}])
+
+    def test_apply_cell_edits_and_prepare_fill_handle_empty_multi_index_matrix_stubs(self):
+        scenario = deepcopy(self.example)
+        scenario['optimization']['pipeline_cost'] = 'capacity_based'
+        data = scenario['data_input']
+        data['df_sets']['PipelineDiameters'] = ['D04', 'D08']
+        # Empty matrix stubs emitted by reader / template
+        data['df_parameters']['PipelineCapexCapacityBased'] = {'NODES': [], 'NODES.1': []}
+        data['df_parameters']['InitialPipelineCapacity'] = {'NODES': []}
+
+        updated = apply_cell_edits(scenario, [
+            {'table': 'PipelineCapexCapacityBased', 'keys': ['P1', 'N1', 'D04'], 'value': 12000},
+            {'table': 'PipelineCapexCapacityBased', 'keys': ['P1', 'N1', 'D08'], 'value': 18000},
+            {'table': 'InitialPipelineCapacity', 'keys': ['P1', 'N1'], 'value': 500},
+        ])
+        params = updated['data_input']['df_parameters']
+        self.assertEqual(
+            flat_table(params['PipelineCapexCapacityBased']),
+            {('P1', 'N1', 'D04'): 12000, ('P1', 'N1', 'D08'): 18000},
+        )
+        self.assertEqual(flat_table(params['InitialPipelineCapacity']), {('P1', 'N1'): 500})
+
+        write_inputs(updated['data_input'], self.path)
+        reloaded = read_inputs(self.path, previous=updated['data_input'])
+        self.assertEqual(
+            flat_table(reloaded['df_parameters']['PipelineCapexCapacityBased']),
+            {('P1', 'N1', 'D04'): 12000, ('P1', 'N1', 'D08'): 18000},
+        )
+
+        # prepare_fill also succeeds starting from {'NODES': [], 'NODES.1': []}
+        stub_scenario = deepcopy(self.example)
+        stub_scenario['optimization']['pipeline_cost'] = 'capacity_based'
+        stub_scenario['data_input']['df_sets']['PipelineDiameters'] = ['D04']
+        stub_scenario['data_input']['df_parameters']['PipelineCapexCapacityBased'] = {'NODES': [], 'NODES.1': []}
+        filled, _ = prepare_fill(stub_scenario, 'costs', 100)
+        self.assertEqual(
+            flat_table(filled['data_input']['df_parameters']['PipelineCapexCapacityBased'])[('P1', 'N1', 'D04')],
+            100,
+        )
+
+    def test_save_inputs_cleanly_reverts_newly_created_table_on_disk(self):
+        import os
+        import importlib
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as db_dir:
+            prev_cwd = os.getcwd()
+            with patch.dict(os.environ, {'PARETO_DATA_BASEDIR': db_dir, 'PARETO_LOG_DIR': db_dir}):
+                handler_mod = importlib.import_module('app.internal.scenario_handler')
+                handler = handler_mod.ScenarioHandler()
+            os.chdir(prev_cwd)
+            try:
+                scenario = deepcopy(self.example)
+                scenario['id'] = 1
+                scenario['data_input']['df_sets']['StorageSites'] = ['S1']
+                scenario['data_input']['df_parameters'].pop('InitialStorageLevel', None)
+                excel_path = handler.get_excelsheet_path(1)
+                write_inputs(scenario['data_input'], excel_path)
+                handler._persist_scenario(scenario)
+                before = handler.get_scenario(1)
+                self.assertNotIn('InitialStorageLevel', before['data_input']['df_parameters'])
+
+                after = deepcopy(before)
+                after['data_input']['df_parameters']['InitialStorageLevel'] = {
+                    'StorageSites': ['S1'],
+                    'VALUE': [500],
+                }
+                saved_after = handler.save_inputs(after)
+                self.assertEqual(
+                    saved_after['data_input']['df_parameters']['InitialStorageLevel'],
+                    {'StorageSites': ['S1'], 'VALUE': [500]},
+                )
+
+                # Reverting to the prior data_input snapshot clears InitialStorageLevel on disk & DB
+                reverted = deepcopy(saved_after)
+                reverted['data_input'] = deepcopy(before['data_input'])
+                saved_reverted = handler.save_inputs(reverted)
+                self.assertNotIn('InitialStorageLevel', saved_reverted['data_input']['df_parameters'])
+                reloaded_disk = read_inputs(excel_path)
+                self.assertEqual(flat_table(reloaded_disk['df_parameters'].get('InitialStorageLevel', {})), {})
+            finally:
+                handler._db.close()

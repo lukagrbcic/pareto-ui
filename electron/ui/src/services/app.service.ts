@@ -1,6 +1,7 @@
 import type {
     ScenarioResponse, ScenarioListResponse, TaskResponse, CopyScenarioResponse,
     UpdateScenarioRequest, UpdateExcelRequest, RunModelRequest, FillScenarioInputsRequest,
+    SaveCompletionCellsRequest,
     Scenario, ScenarioId, ScenarioValidationResult, ScenarioFillPreview,
 } from '../types';
 import {ApiClientError, requestJson, requestWorkbook, scenarioId} from './apiClient';
@@ -11,7 +12,13 @@ import {decodeSavedScenario, decodeScenarioList, scenarioFor} from './contracts/
 import {copiedScenarioFor, deletedScenarioFor} from './contracts/collection';
 import {decodeTasks, decodeValidationResult, fillPreviewFor, runFor} from './contracts/workflow';
 import {decodeAIAvailability, decodeAIBackendSettings, decodeAIPromptResponse, decodeAIOptimizationDiagnosis} from './contracts/ai';
-import type {AIBackendSettings, AIPromptResponse, AIOptimizationDiagnosisResponse} from '../types/ai';
+import type {
+    AIBackendSettings,
+    AIChatHistoryEntry,
+    AIPromptResponse,
+    AIPromptUpdatedScenario,
+    AIOptimizationDiagnosisResponse,
+} from '../types/ai';
 
 let BACKEND_URL = "http://localhost"
 
@@ -168,6 +175,13 @@ export async function fillScenarioInputs(port: number, id: ScenarioId, payload: 
     });
 }
 
+export async function saveCompletionCells(port: number, id: ScenarioId, payload: SaveCompletionCellsRequest): Promise<Scenario> {
+    const parsedId = scenarioId(id);
+    return requestJson<Scenario>(`${BACKEND_URL}:${port}/save_completion_cells/${parsedId}`, scenarioFor(parsedId, true), {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+    });
+}
+
 export const checkScenarioFeasibility = async (port: number, id: ScenarioId): Promise<ScenarioValidationResult> =>
     requestJson(`${BACKEND_URL}:${port}/scenario_feasibility/${scenarioId(id)}`, decodeValidationResult, {method: 'POST'});
 
@@ -192,15 +206,30 @@ export const saveAISettings = (backend_port: number, settings: {api_key?: string
 export const resetAISettings = (backend_port: number): Promise<AIBackendSettings> =>
     requestJson(`${BACKEND_URL}:${backend_port}/ai_settings`, decodeAIBackendSettings, {method: 'DELETE'});
 
-export const requestAIDataUpdate = async (backend_port: number, id: ScenarioId, prompt: string, validationFindings?: unknown): Promise<AIPromptResponse> => {
+export const requestAIDataUpdate = async (
+    backend_port: number,
+    id: ScenarioId,
+    prompt: string,
+    validationFindings?: unknown,
+    options?: {
+        conversationHistory?: AIChatHistoryEntry[];
+        stagedUpdates?: AIPromptUpdatedScenario | null;
+    },
+): Promise<AIPromptResponse> => {
     const endpoint = `${BACKEND_URL}:${backend_port}/request_ai_data_update/${scenarioId(id)}`
+    const payload: Record<string, unknown> = { prompt };
+    if (validationFindings != null) payload.validation_findings = validationFindings;
+    if (options?.conversationHistory && options.conversationHistory.length > 0) {
+        payload.conversation_history = options.conversationHistory;
+    }
+    if (options?.stagedUpdates && Object.keys(options.stagedUpdates).length > 0) {
+        payload.staged_updates = options.stagedUpdates;
+    }
     return requestJson(endpoint, decodeAIPromptResponse, {
         method: 'POST',
         mode: 'cors',
         headers: {'Content-Type': 'application/json'},
-        // Attach validation evidence when provided so the backend embeds it in
-        // the fill prompt; omit the key entirely for standalone prompt-only runs.
-        body: JSON.stringify(validationFindings != null ? {"prompt": prompt, "validation_findings": validationFindings} : {"prompt": prompt})
+        body: JSON.stringify(payload)
     });
 }
 

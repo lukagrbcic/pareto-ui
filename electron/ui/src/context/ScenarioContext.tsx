@@ -1,6 +1,6 @@
 // src/ScenarioContext.tsx
 import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
-import type { AppState, AppAction, Scenario, ScenarioMap, ValidationIssue, ParameterTable, ScenarioPropagation, OptimizationStart } from "../types";
+import type { AppState, AppAction, Scenario, ScenarioMap, ScenarioOverrides, ScenarioUndoEntry, ScenarioUndoSnapshot, ValidationIssue, ParameterTable, ScenarioPropagation, OptimizationStart } from "../types";
 import {
   updateScenario,
   updateExcel,
@@ -15,10 +15,80 @@ import { useApp } from "../AppContext";
 import {applyScenarioEdits, copyScenario as copyInputs, scenarioEdits, ScenarioEdit} from '../scenarioEdits';
 import {ApiClientError} from '../services/apiClient';
 import {COMPLETED_STATES, isRunStatus, RUNNING_STATES} from '../services/contracts/workflow';
+import { CategoryNames } from '../util';
 
 type NavigateFn = (to: string, opts?: { replace?: boolean }) => void;
 
 export type {OptimizationStart} from '../types/scenario';
+
+const MAX_UNDO_STEPS = 20;
+const makeUndoId = (): string => `undo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const normalizeOverrideValues = (overrides?: ScenarioOverrides): ScenarioOverrides | undefined => {
+  if (!overrides || typeof overrides !== 'object') return undefined;
+  const nonEmpty = Object.entries(overrides).filter(
+    ([, table]) => table != null && typeof table === 'object' && Object.keys(table).length > 0,
+  );
+  return nonEmpty.length > 0 ? (Object.fromEntries(nonEmpty) as ScenarioOverrides) : undefined;
+};
+
+const modelInputsEqual = (
+  a: Pick<ScenarioUndoSnapshot, 'data_input' | 'optimization' | 'override_values'>,
+  b: Pick<ScenarioUndoSnapshot, 'data_input' | 'optimization' | 'override_values'>,
+): boolean =>
+  JSON.stringify(a.data_input) === JSON.stringify(b.data_input) &&
+  JSON.stringify(a.optimization) === JSON.stringify(b.optimization) &&
+  JSON.stringify(normalizeOverrideValues(a.override_values)) ===
+    JSON.stringify(normalizeOverrideValues(b.override_values));
+
+const undoSnapshotsEqual = (a: ScenarioUndoSnapshot, b: ScenarioUndoSnapshot): boolean =>
+  a.name === b.name && modelInputsEqual(a, b);
+
+const extractUndoSnapshot = (scenario: Scenario): ScenarioUndoSnapshot => ({
+  name: scenario.name,
+  data_input: copyInputs(scenario.data_input),
+  optimization: copyInputs(scenario.optimization),
+  ...(scenario.override_values !== undefined ? { override_values: copyInputs(scenario.override_values) } : {}),
+  status: scenario.results?.status ?? null,
+  ...(scenario.input_revision ? { input_revision: scenario.input_revision } : {}),
+});
+
+const inferUndoLabel = (
+  before: Scenario,
+  after: Scenario,
+  propagateChanges?: ScenarioPropagation,
+): string => {
+  if (propagateChanges === 'map') return 'Saved network map edit';
+  const beforePeriods = before.data_input?.df_sets?.TimePeriods;
+  const afterPeriods = after.data_input?.df_sets?.TimePeriods;
+  if (JSON.stringify(beforePeriods) !== JSON.stringify(afterPeriods)) {
+    return 'Updated planning periods';
+  }
+  const beforeParams = before.data_input?.df_parameters || {};
+  const afterParams = after.data_input?.df_parameters || {};
+  const allTables = Array.from(new Set([...Object.keys(beforeParams), ...Object.keys(afterParams)]));
+  const changedTables = allTables.filter(
+    key => JSON.stringify(beforeParams[key]) !== JSON.stringify(afterParams[key]),
+  );
+  const setsChanged =
+    JSON.stringify(before.data_input?.df_sets || {}) !== JSON.stringify(after.data_input?.df_sets || {});
+  if (changedTables.length === 1 && !setsChanged) {
+    const key = changedTables[0];
+    return `Saved ${CategoryNames[key] || key}`;
+  }
+  if (changedTables.length > 1) {
+    return `Saved ${changedTables.length} input tables`;
+  }
+  if (setsChanged) return 'Updated scenario sets';
+  if (before.name !== after.name) return 'Renamed scenario';
+  if (JSON.stringify(before.optimization) !== JSON.stringify(after.optimization)) {
+    return 'Updated optimization settings';
+  }
+  if (JSON.stringify(before.override_values) !== JSON.stringify(after.override_values)) {
+    return 'Updated model overrides';
+  }
+  return 'Saved scenario changes';
+};
 
 const newRunId = () => Array.from(crypto.getRandomValues(new Uint32Array(4)), value => value.toString(16).padStart(8, '0')).join('');
 
@@ -45,6 +115,12 @@ export interface ScenarioContextValue {
   acceptSavedScenario: (scenario: Scenario) => void;
   inputFocus: ValidationIssue | null;
   focusInputIssue: (issue: ValidationIssue) => void;
+  undoHistory: ScenarioUndoEntry[];
+  canRevertSaved: boolean;
+  getLatestUndoEntry: (id?: string | number) => ScenarioUndoEntry | null;
+  revertLastSavedChange: (id?: string | number) => Promise<ScenarioUndoEntry | null>;
+  discardDraftEdits: (id?: string | number) => void;
+  markNextSaveMeta: (id: string | number, meta: { label: string; source: 'user' | 'ai' }) => void;
 
   // setters
   setScenarios: React.Dispatch<React.SetStateAction<ScenarioMap>>;
@@ -98,6 +174,32 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
   const failedSaves = useRef(new Map<string, string>());
   const selectedId = useRef<string | null>(null);
   const navigationVersion = useRef(0);
+  const [undoStacks, setUndoStacks] = useState<Record<string, ScenarioUndoEntry[]>>({});
+  const undoStacksRef = useRef<Record<string, ScenarioUndoEntry[]>>({});
+  const nextSaveMetaRef = useRef<Record<string, { label: string; source: 'user' | 'ai' }>>({});
+  const pushUndoEntry = (id: string, entry: ScenarioUndoEntry) => {
+    const existing = undoStacksRef.current[id] || [];
+    const nextStack = [...existing, entry].slice(-MAX_UNDO_STEPS);
+    const nextAll = { ...undoStacksRef.current, [id]: nextStack };
+    undoStacksRef.current = nextAll;
+    setUndoStacks(nextAll);
+  };
+  const clearUndoForScenario = (id: string) => {
+    if (!undoStacksRef.current[id]) return;
+    const nextAll = { ...undoStacksRef.current };
+    delete nextAll[id];
+    undoStacksRef.current = nextAll;
+    setUndoStacks(nextAll);
+  };
+  const markNextSaveMeta = (id: string | number, meta: { label: string; source: 'user' | 'ai' }) => {
+    nextSaveMetaRef.current[String(id)] = meta;
+  };
+  const getLatestUndoEntry = (id?: string | number): ScenarioUndoEntry | null => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    if (!targetId) return null;
+    const stack = undoStacksRef.current[targetId];
+    return stack && stack.length > 0 ? stack[stack.length - 1] : null;
+  };
   const starts = useRef<Record<string, OptimizationStart>>({});
   const [optimizationStarts, setOptimizationStarts] = useState<Record<string, OptimizationStart>>({});
   const updateStart = (id: string, state?: OptimizationStart) => {
@@ -115,23 +217,55 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
       handleSetSection(1);
       return;
     }
+    sectionRef.current = 0;
     setSection(0);
     setCategory(target);
-    setAppState(previous => ({...previous, section: 0, category: {...previous?.category, 0: target}} as AppState));
+    setAppState(previous => {
+      const baseCategories: Record<number, string | null> = {
+        0: "Input Summary",
+        1: null,
+        2: "Dashboard",
+        ...(previous?.category || {}),
+      };
+      baseCategories[0] = target;
+      const next: AppState = { section: 0, category: baseCategories };
+      appStateRef.current = next;
+      return next;
+    });
   };
   const publishDraft = (draft: Scenario) => {
     // Keep an independent baseline even when a form mutates its scenario prop.
     drafts.current[String(draft.id)] = copyInputs(draft);
-    setScenarios(previous => ({...previous, [draft.id]: draft}));
+    setScenarios(previous => ({...previous, [draft.id]: copyInputs(draft)}));
     setScenarioData(previous => String(previous?.id) === String(draft.id) ? draft : previous);
   };
-  const acceptSavedScenario = (saved: Scenario) => {
+  const applyServerScenario = (saved: Scenario) => {
     const id = String(saved.id);
     savedScenarios.current[id] = copyInputs(saved);
     const draft = (pendingEdits.current[id] || []).reduce(
       (current, pending) => applyScenarioEdits(current, pending.edits), copyInputs(saved));
     publishDraft(draft);
     if (selectedId.current === id) setSaveError(failedSaves.current.get(id) || null);
+  };
+  const acceptSavedScenario = (saved: Scenario) => {
+    const id = String(saved.id);
+    const prevSaved = savedScenarios.current[id];
+    const pendingMeta = nextSaveMetaRef.current[id];
+    delete nextSaveMetaRef.current[id];
+    if (prevSaved) {
+      const beforeSnap = extractUndoSnapshot(prevSaved);
+      const afterSnap = extractUndoSnapshot(saved);
+      if (!undoSnapshotsEqual(beforeSnap, afterSnap)) {
+        pushUndoEntry(id, {
+          id: makeUndoId(),
+          label: pendingMeta?.label || inferUndoLabel(prevSaved, saved),
+          source: pendingMeta?.source || 'user',
+          timestamp: new Date().toISOString(),
+          snapshot: beforeSnap,
+        });
+      }
+    }
+    applyServerScenario(saved);
   };
   const enqueueSave = (id: string, work: () => Promise<void>): Promise<boolean> => {
     setPendingSaves(count => count + 1);
@@ -149,7 +283,12 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     saveQueue.current = request;
     return request;
   };
-  const queueScenarioEdit = (base: Scenario, edits: ScenarioEdit[], send: (current: Scenario) => Promise<Scenario>): Promise<boolean> => {
+  const queueScenarioEdit = (
+    base: Scenario,
+    edits: ScenarioEdit[],
+    send: (current: Scenario) => Promise<Scenario>,
+    options?: { skipUndo?: boolean; defaultLabel?: string; source?: 'user' | 'ai' },
+  ): Promise<boolean> => {
     saveRequests.current += 1;
     const id = String(base.id);
     if (!savedScenarios.current[id]) savedScenarios.current[id] = copyInputs(base);
@@ -158,10 +297,26 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     publishDraft(applyScenarioEdits(base, edits));
     return enqueueSave(id, async () => {
       if (failedSaves.current.has(id)) throw new Error('A previous save failed. Reload saved inputs before making more changes.');
+      const prevSaved = savedScenarios.current[id] ? copyInputs(savedScenarios.current[id]) : null;
+      const pendingMeta = nextSaveMetaRef.current[id];
+      delete nextSaveMetaRef.current[id];
       try {
         const saved = await send(applyScenarioEdits(savedScenarios.current[id], edits));
         pendingEdits.current[id] = pendingEdits.current[id].filter(item => item !== pending);
-        acceptSavedScenario(saved);
+        if (!options?.skipUndo && prevSaved) {
+          const beforeSnap = extractUndoSnapshot(prevSaved);
+          const afterSnap = extractUndoSnapshot(saved);
+          if (!undoSnapshotsEqual(beforeSnap, afterSnap)) {
+            pushUndoEntry(id, {
+              id: makeUndoId(),
+              label: pendingMeta?.label || options?.defaultLabel || inferUndoLabel(prevSaved, saved),
+              source: pendingMeta?.source || options?.source || 'user',
+              timestamp: new Date().toISOString(),
+              snapshot: beforeSnap,
+            });
+          }
+        }
+        applyServerScenario(saved);
       } catch (error) {
         // Keep unsaved edits visible, but do not let later requests hide a failed save.
         failedSaves.current.set(id, error instanceof Error ? error.message : 'Unable to save scenario. Reload saved inputs before making more changes.');
@@ -191,6 +346,8 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
   const INITIAL_STATES = useMemo(() => ["Draft", "Incomplete"], []);
   const sectionRef = useRef(section);
   sectionRef.current = section;
+  const appStateRef = useRef<AppState | null>(appState);
+  appStateRef.current = appState;
 
   // ---- helper function for updating the state of the app (category, section...) ----
   const updateAppState = (action: AppAction, index?: string | number): void => {
@@ -199,14 +356,17 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
       let tempCategory: Record<number, string | null>;
       const status = scenarios[index!].results.status;
 
-      if (appState) {
-        if (INITIAL_STATES.includes(status) && appState.section === 2) {
+      if (appStateRef.current) {
+        if (INITIAL_STATES.includes(status) && appStateRef.current.section === 2) {
           tempSection = 0;
-          tempCategory = appState.category;
+          tempCategory = { ...appStateRef.current.category };
         } else {
-          tempSection = appState.section;
-          tempCategory = status === "Draft" ? appState.category : { 0: "Input Summary", 1: null, 2: "Dashboard" };
+          tempSection = appStateRef.current.section;
+          tempCategory = status === "Draft" ? { ...appStateRef.current.category } : { 0: "Input Summary", 1: null, 2: "Dashboard" };
         }
+        const tempState = { section: tempSection, category: tempCategory };
+        appStateRef.current = tempState;
+        setAppState(tempState);
       } else {
         if (COMPLETED_STATES.includes(status) || RUNNING_STATES.includes(status)) {
           tempSection = 2;
@@ -215,27 +375,46 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
         }
         tempCategory = { 0: "Input Summary", 1: null, 2: "Dashboard" };
         const tempState = { section: tempSection, category: tempCategory };
+        appStateRef.current = tempState;
         setAppState(tempState);
       }
 
+      sectionRef.current = tempSection;
       setSection(tempSection);
       setCategory(tempCategory[tempSection]);
     } else if (action.action === "new") {
       const tempSection = 0;
       const tempCategory = { 0: "Input Summary", 1: null, 2: "Dashboard" };
       const tempState = { section: tempSection, category: tempCategory };
+      sectionRef.current = tempSection;
+      appStateRef.current = tempState;
       setAppState(tempState);
       setSection(tempSection);
       setCategory(tempCategory[tempSection]);
     } else if (action.action === "section") {
-      const tempState = { ...(appState as AppState) };
-      tempState.section = action.section;
+      const nextCategories = {
+        0: "Input Summary",
+        1: null,
+        2: "Dashboard",
+        ...(appStateRef.current?.category || {}),
+      };
+      const tempState: AppState = { section: action.section, category: nextCategories };
+      sectionRef.current = action.section;
+      appStateRef.current = tempState;
       setAppState(tempState);
       setSection(action.section);
-      setCategory(tempState.category[action.section]);
+      setCategory(nextCategories[action.section]);
     } else if (action.action === "category") {
-      const tempState = { ...(appState as AppState) };
-      tempState.category[section] = action.category;
+      const targetSection = sectionRef.current;
+      const nextCategories = {
+        0: "Input Summary",
+        1: null,
+        2: "Dashboard",
+        ...(appStateRef.current?.category || {}),
+        [targetSection]: action.category,
+      };
+      const tempState: AppState = { section: targetSection, category: nextCategories };
+      appStateRef.current = tempState;
       setAppState(tempState);
       setCategory(action.category);
     }
@@ -284,10 +463,16 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     selectedId.current = String(scenario);
     setInputFocus(null);
     navigate("/scenario", { replace: true });
-    const draft = pendingEdits.current[String(scenario)]?.length ? drafts.current[String(scenario)] : scenarios[scenario];
-    if (!pendingEdits.current[String(scenario)]?.length) savedScenarios.current[String(scenario)] = copyInputs(scenarios[scenario]);
-    drafts.current[String(scenario)] = copyInputs(draft);
-    setSaveError(failedSaves.current.get(String(scenario)) || null);
+    const idStr = String(scenario);
+    if (!pendingEdits.current[idStr]?.length && !savedScenarios.current[idStr]) {
+      savedScenarios.current[idStr] = copyInputs(scenarios[scenario]);
+    }
+    const cleanBase = savedScenarios.current[idStr] || scenarios[scenario];
+    const draft = copyInputs(
+      pendingEdits.current[idStr]?.length ? drafts.current[idStr] : cleanBase,
+    );
+    drafts.current[idStr] = copyInputs(draft);
+    setSaveError(failedSaves.current.get(idStr) || null);
     setScenarioData(draft);
     setScenarioIndex(scenario);
     updateAppState({ action: "select" }, scenario);
@@ -311,10 +496,15 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     const snapshot = copyInputs(updatedScenario);
     if (snapshot.results.status === 'Optimized' && !keepOptimized) snapshot.results.status = 'Not Optimized';
     const base = drafts.current[String(snapshot.id)] || scenarios[snapshot.id] || snapshot;
-    return queueScenarioEdit(base, scenarioEdits(base, snapshot), async current => {
-      const body = await updateScenario(port, {updatedScenario: current, propagateChanges});
-      return body.data;
-    });
+    return queueScenarioEdit(
+      base,
+      scenarioEdits(base, snapshot),
+      async current => {
+        const body = await updateScenario(port, {updatedScenario: current, propagateChanges});
+        return body.data;
+      },
+      { defaultLabel: inferUndoLabel(base, snapshot, propagateChanges) },
+    );
   };
 
   const handleEditScenarioName = (newName: string, id: string | number, updateScenarioData?: boolean): void => {
@@ -324,6 +514,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
 
   const handleDeleteScenario = async (index: string | number): Promise<void> => {
     const data = await deleteScenario(port, {id: index});
+    clearUndoForScenario(String(index));
     setScenarios(data.data);
     updateAppState({action: 'delete'}, index);
   };
@@ -332,8 +523,12 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     const table = copyInputs(updatedTable);
     const base = drafts.current[String(id)] || scenarios[id];
     const edits = [{path: ['data_input', 'df_parameters', tableKey], value: table}];
-    return queueScenarioEdit(base, edits, current => updateExcel(port, {id, tableKey, updatedTable: table,
-      revision: current.input_revision}));
+    return queueScenarioEdit(
+      base,
+      edits,
+      current => updateExcel(port, {id, tableKey, updatedTable: table, revision: current.input_revision}),
+      { defaultLabel: `Saved ${CategoryNames[tableKey] || tableKey}` },
+    );
   };
 
   const syncScenarioData = (): void => {
@@ -350,7 +545,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
         if (!saved) throw new Error('The saved scenario is no longer available. Your draft has been kept.');
         pendingEdits.current[id] = [];
         failedSaves.current.delete(id);
-        acceptSavedScenario(saved);
+        applyServerScenario(saved);
       })
       .catch(error => {
         if (selectedId.current === id && navigationVersion.current === navigation && saveRequests.current === requestVersion) {
@@ -359,18 +554,113 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
       });
   };
 
+  const discardDraftEdits = (id?: string | number): void => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    if (targetId && savedScenarios.current[targetId] && pendingSaves === 0 && !failedSaves.current.has(targetId)) {
+      pendingEdits.current[targetId] = [];
+      publishDraft(copyInputs(savedScenarios.current[targetId]));
+      return;
+    }
+    syncScenarioData();
+  };
+
+  const revertLastSavedChange = async (id?: string | number): Promise<ScenarioUndoEntry | null> => {
+    const targetId = String(id ?? selectedId.current ?? '');
+    if (!targetId || pendingSaves > 0 || failedSaves.current.has(targetId)) return null;
+    if (activeTasks.current.some(task => String(task) === targetId)) return null;
+    if (starts.current[targetId] && starts.current[targetId].phase !== 'rejected') return null;
+    const stack = undoStacksRef.current[targetId] || [];
+    if (!stack.length) return null;
+    const entry = stack[stack.length - 1];
+    const base = drafts.current[targetId] || savedScenarios.current[targetId] || scenarios[targetId];
+    if (!base) return null;
+    const restored: Scenario = {
+      ...copyInputs(base),
+      name: entry.snapshot.name,
+      data_input: copyInputs(entry.snapshot.data_input),
+      optimization: copyInputs(entry.snapshot.optimization),
+      ...(entry.snapshot.override_values !== undefined
+        ? { override_values: copyInputs(entry.snapshot.override_values) }
+        : {}),
+    };
+    if (entry.snapshot.override_values === undefined) {
+      delete restored.override_values;
+    }
+    const modelInputsChanged = !modelInputsEqual(base, restored);
+    if (modelInputsChanged) {
+      if (
+        entry.snapshot.status === 'Optimized' &&
+        entry.snapshot.input_revision &&
+        base.results?.input_revision === entry.snapshot.input_revision
+      ) {
+        restored.results = { ...restored.results, status: 'Optimized' };
+      } else if (
+        entry.snapshot.status === 'Draft' ||
+        entry.snapshot.status === 'Incomplete' ||
+        ['Infeasible', 'failure'].includes(String(base.results?.status || ''))
+      ) {
+        restored.results = {
+          status: entry.snapshot.status === 'Incomplete' ? 'Incomplete' : 'Draft',
+          data: {},
+        };
+        delete restored.optimized_override_values;
+      } else if (restored.results?.status === 'Optimized') {
+        restored.results = { ...restored.results, status: 'Not Optimized' };
+      }
+      if (restored.aiDiagnosis) {
+        restored.aiDiagnosis = { ...restored.aiDiagnosis, outdated: true };
+      }
+    }
+    const ok = await queueScenarioEdit(
+      base,
+      scenarioEdits(base, restored),
+      async current => {
+        const body = await updateScenario(port, { updatedScenario: current });
+        return body.data;
+      },
+      { skipUndo: true },
+    );
+    if (!ok) return null;
+    const currentStack = undoStacksRef.current[targetId] || [];
+    const nextStack = currentStack.filter(item => item.id !== entry.id);
+    const nextAll = { ...undoStacksRef.current, [targetId]: nextStack };
+    undoStacksRef.current = nextAll;
+    setUndoStacks(nextAll);
+    if (
+      modelInputsChanged &&
+      restored.results?.status !== 'Optimized' &&
+      String(selectedId.current) === targetId &&
+      sectionRef.current === 2
+    ) {
+      handleSetSection(0);
+    }
+    return entry;
+  };
+
   const addTask = (id: string | number): void => {
     if (!activeTasks.current.some(task => String(task) === String(id))) updateTasks([...activeTasks.current, id]);
   };
 
   const openOptimizationResults = () => {
+    sectionRef.current = 2;
     setSection(2);
     setCategory('Dashboard');
-    setAppState(previous => ({...previous, section: 2, category: {...previous?.category, 2: 'Dashboard'}} as AppState));
+    setAppState(previous => {
+      const baseCategories: Record<number, string | null> = {
+        0: "Input Summary",
+        1: null,
+        2: "Dashboard",
+        ...(previous?.category || {}),
+      };
+      baseCategories[2] = 'Dashboard';
+      const next: AppState = { section: 2, category: baseCategories };
+      appStateRef.current = next;
+      return next;
+    });
   };
 
   const acceptRun = (scenario: Scenario) => {
-    acceptSavedScenario(scenario);
+    applyServerScenario(scenario);
     if (RUNNING_STATES.includes(scenario.results.status)) addTask(scenario.id);
     updateStart(String(scenario.id));
   };
@@ -391,7 +681,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
           const saved = await fetchScenario(port, id);
           if (saved && starts.current[id]?.runId === start.runId && starts.current[id]?.phase === 'rejected') {
             if (error.status === 409 && RUNNING_STATES.includes(saved.results.status)) acceptRun(saved);
-            else acceptSavedScenario(saved);
+            else applyServerScenario(saved);
           }
         } catch { /* The rejection is known even if refreshing its inputs fails. */ }
         return;
@@ -436,7 +726,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     try {
       const body = await copyScenario(port, scenarioData.id, newScenarioName);
       const copied = body.scenarios[body.new_id];
-      acceptSavedScenario(copied);
+      applyServerScenario(copied);
       updateStart(original);
       // Honor navigation made while the copy request was pending.
       if (selectedId.current === original && navigationVersion.current === navigation) {
@@ -465,6 +755,9 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
             for (const key in data.data) {
               const scenario = { ...data.data[key] };
               tempScenarios[key] = scenario;
+              if (!pendingEdits.current[key]?.length && !savedScenarios.current[key]) {
+                savedScenarios.current[key] = copyInputs(scenario);
+              }
 
               if (RUNNING_STATES.includes(scenario.results.status) && !tasks.includes(scenario.id)) {
                 scenario.results.status = "Draft";
@@ -499,7 +792,7 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
           const current = await fetchScenario(port, id);
           if (stopped) return;
           // An unchanged poll must not reload maps or reset their local view state.
-          if (JSON.stringify(savedScenarios.current[String(id)]) !== JSON.stringify(current)) acceptSavedScenario(current);
+          if (JSON.stringify(savedScenarios.current[String(id)]) !== JSON.stringify(current)) applyServerScenario(current);
           if (COMPLETED_STATES.includes(current.results.status)) {
             completed.push(id);
             setLastCompletedScenario(id);
@@ -526,6 +819,17 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [backgroundTasks, port]);
 
+  const currentUndoHistory = scenarioData ? (undoStacks[String(scenarioData.id)] || []) : [];
+  const activeLaunch = scenarioData ? optimizationStarts[String(scenarioData.id)] : undefined;
+  const canRevertSaved = Boolean(
+    scenarioData &&
+    currentUndoHistory.length > 0 &&
+    pendingSaves === 0 &&
+    !saveError &&
+    !(activeLaunch && activeLaunch.phase !== 'rejected') &&
+    !backgroundTasks.some(task => String(task) === String(scenarioData.id)),
+  );
+
   const value: ScenarioContextValue = {
     scenarioData,
     scenarios,
@@ -548,6 +852,12 @@ export const ScenarioProvider: React.FC<ScenarioProviderProps> = ({ children, na
     acceptSavedScenario,
     inputFocus,
     focusInputIssue,
+    undoHistory: currentUndoHistory,
+    canRevertSaved,
+    getLatestUndoEntry,
+    revertLastSavedChange,
+    discardDraftEdits,
+    markNextSaveMeta,
 
     setScenarios,
     setCompareScenarioIndexes,

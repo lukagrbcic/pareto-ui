@@ -1,4 +1,5 @@
 """App-wide AI configuration; credentials never belong to a scenario."""
+import threading
 from urllib.parse import urlsplit
 import openai
 
@@ -13,10 +14,12 @@ class AIConfiguration:
     def __init__(self, environment):
         self.environment = environment
         self._user_client = None
+        self._lock = threading.RLock()
 
     @property
     def active_client(self):
-        return self._user_client or self.environment
+        with self._lock:
+            return self._user_client or self.environment
 
     def is_available(self):
         return self.active_client.is_available()
@@ -27,9 +30,11 @@ class AIConfiguration:
 
     def describe(self):
         client = self.active_client
+        with self._lock:
+            source = "user" if self._user_client else "environment" if client.is_available() else "none"
         return {
             "available": client.is_available(),
-            "source": "user" if self._user_client else "environment" if client.is_available() else "none",
+            "source": source,
             "base_url": client.base_url or "",
             "model": client.model,
             "environment_available": self.environment.is_available(),
@@ -52,19 +57,21 @@ class AIConfiguration:
         if api_key is not None and not isinstance(api_key, str):
             raise AISettingsError("Enter a valid API key.")
         key = (api_key or '').strip()
-        if not key:
-            # Never forward an existing key to a different endpoint or copy an
-            # environment key into user settings without explicit key entry.
-            if not self._user_client or base_url != self._user_client.base_url:
-                raise AISettingsError("Enter an API key when configuring AI or changing the API endpoint.")
-            key = self._user_client.api_key
-        client = OpenAIClientWrapper(api_key=key, base_url=base_url, model=model, max_retries=2)
-        self._user_client = client
-        return self.describe()
+        with self._lock:
+            if not key:
+                # Never forward an existing key to a different endpoint or copy an
+                # environment key into user settings without explicit key entry.
+                if not self._user_client or base_url != self._user_client.base_url:
+                    raise AISettingsError("Enter an API key when configuring AI or changing the API endpoint.")
+                key = self._user_client.api_key
+            client = OpenAIClientWrapper(api_key=key, base_url=base_url, model=model, max_retries=2)
+            self._user_client = client
+            return self.describe()
 
     def reset(self):
-        self._user_client = None
-        return self.describe()
+        with self._lock:
+            self._user_client = None
+            return self.describe()
 
     def prompt(self, *args, **kwargs):
         # Keep one configuration throughout an in-flight request, even if the

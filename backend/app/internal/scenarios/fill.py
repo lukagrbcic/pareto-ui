@@ -4,8 +4,17 @@ from copy import deepcopy
 from functools import lru_cache
 import math
 
-from app.internal.scenarios.input_schema import FORECASTS, dimension_count, input_revision
+from app.internal.scenarios.input_schema import FORECASTS, NODE_SETS, OPTION_SETS, dimension_count, input_revision
 from app.internal.validation.scenario_validation import REQUIREMENTS, SECTION_NAMES, numeric, validate_inputs
+
+
+_INDEX_HEADERS = {s.lower() for s in (*NODE_SETS, *OPTION_SETS, 'TimePeriods')} | {
+    'nodes', 'pads', 'index', 'time', 'quantity', 'freshwatersources'
+}
+
+
+def _is_index_header(header):
+    return str(header).split('.')[0].lower() in _INDEX_HEADERS
 
 
 @lru_cache(maxsize=1)
@@ -38,10 +47,22 @@ def set_cell(tables, table, keys, value, periods):
             requirement = next((item for item in REQUIREMENTS if item.table == table), None)
             if requirement:
                 headers = [requirement.node_set, 'VALUE']
+            elif len(keys) == 1:
+                headers = ['INDEX', 'VALUE']
         # Empty matrix templates contain only their index headings.
         if headers and headers[-1].lower() != 'value' and len(headers) < len(keys):
             headers = [*headers, keys[-1]]
         columns = {header: [] for header in headers}
+    if (isinstance(columns, dict) and columns and
+            all(isinstance(v, list) for v in columns.values()) and
+            len({len(v) for v in columns.values()}) == 1):
+        existing_headers = list(columns)
+        if (existing_headers[-1].lower() != 'value' and
+                all(_is_index_header(h) for h in existing_headers) and
+                len(existing_headers) == len(keys) - 1 and
+                keys[-1] not in columns):
+            row_count = len(columns[existing_headers[0]])
+            columns = {**columns, keys[-1]: [''] * row_count}
     if (not isinstance(columns, dict) or len(columns) < 2 or
             any(not isinstance(v, list) for v in columns.values()) or
             len({len(v) for v in columns.values()}) != 1):
@@ -101,3 +122,65 @@ def prepare_fill(scenario, section, value):
         'revision': input_revision(scenario), 'value': number, 'cell_count': len(selected),
         'tables': [{'name': name, 'cell_count': count, 'unit': units.get(name, '')} for name, count in sorted(counts.items())],
     }
+
+
+UNIT_INTERVAL_TABLES = frozenset({
+    'DisposalOperatingCapacity',
+    'TreatmentEfficiency',
+    'DesalinationTechnologies',
+    'DesalinationSites',
+    'CompletionsPadOutsideSystem',
+})
+
+
+def _cell_bounds(table, keys, targets):
+    if (table, keys) in targets:
+        target = targets[(table, keys)]
+        return target['minimum'], target['maximum']
+    requirement = next((item for item in REQUIREMENTS if item.table == table), None)
+    if requirement is not None:
+        return requirement.minimum, requirement.maximum
+    if table == 'ReuseCapacity':
+        return -1, math.inf
+    if table in UNIT_INTERVAL_TABLES:
+        return 0, 1
+    return 0, math.inf
+
+
+def apply_cell_edits(scenario, edits):
+    """Validate and apply individual cell edits from Complete Scenario Inputs."""
+    if not isinstance(edits, list) or not edits:
+        raise ValueError('Provide at least one cell edit to save.')
+    targets = {}
+    result = validate_inputs(scenario, fill_targets=targets)
+    normalized = []
+    for item in edits:
+        if not isinstance(item, dict):
+            raise ValueError('Each cell edit must be an object with table, keys, and value.')
+        table = item.get('table')
+        raw_keys = item.get('keys')
+        raw_value = item.get('value')
+        if not isinstance(table, str) or not table.strip():
+            raise ValueError('Each cell edit requires a table name.')
+        if (not isinstance(raw_keys, (list, tuple)) or not raw_keys or
+                any(not isinstance(k, str) or not k.strip() for k in raw_keys)):
+            raise ValueError(f'{table}: each cell edit requires nonempty row/column keys.')
+        keys = tuple(k.strip() for k in raw_keys)
+        number = numeric(raw_value)
+        if number is None or isinstance(raw_value, bool):
+            raise ValueError(f"{table} ({' / '.join(keys)}): enter a finite numeric value.")
+        minimum, maximum = _cell_bounds(table, keys, targets)
+        if (not minimum <= number <= maximum or
+                (table == 'ReuseCapacity' and -1 < number < 0)):
+            bound = (f'at least {minimum:g}' if maximum == math.inf else
+                     f'between {minimum:g} and {maximum:g}')
+            if table == 'ReuseCapacity':
+                bound = 'nonnegative, or -1 for unrestricted capacity'
+            raise ValueError(f"{table} ({' / '.join(keys)}) requires a value {bound}.")
+        clean_number = int(number) if number.is_integer() else number
+        normalized.append((table, keys, clean_number))
+    updated = deepcopy(scenario)
+    tables = updated['data_input'].setdefault('df_parameters', {})
+    for table, keys, clean_number in normalized:
+        set_cell(tables, table, keys, clean_number, result['periods'])
+    return updated

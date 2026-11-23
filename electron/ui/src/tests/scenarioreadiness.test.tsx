@@ -40,3 +40,43 @@ test('editing a fill value invalidates the preview and prevents accidental bulk 
   fireEvent.change(screen.getByLabelText('Value (bbl/day)'), {target: {value: '500'}});
   expect(screen.getByRole('button', {name: 'Apply changes'})).toBeDisabled();
 });
+
+test('validation dialog shows Review with AI when there are no errors and Fix with AI only for errors', () => {
+  const onAskAI = jest.fn();
+  const warning = {code: 'default_used', section: 'costs', severity: 'warning' as const,
+    table: 'BeneficialReuseCost', row: ['O1'], message: 'Uses default 0.'};
+  const error = {code: 'missing_value', section: 'forecasts', severity: 'error' as const,
+    table: 'PadRates', row: ['P1'], period: 'T01', message: 'Enter a forecast.'};
+
+  const {rerender} = render(
+    <ScenarioValidationDialog open loading={false}
+      result={{valid: true, state: 'model_built', error_count: 0, warning_count: 0, issues: []}}
+      onAskAI={onAskAI} onClose={jest.fn()}/>
+  );
+  expect(screen.getByRole('button', {name: 'Review with AI'})).toBeInTheDocument();
+  expect(screen.queryByRole('button', {name: 'Fix with AI'})).not.toBeInTheDocument();
+
+  rerender(
+    <ScenarioValidationDialog open loading={false}
+      result={{valid: true, state: 'model_built', error_count: 0, warning_count: 1, issues: [warning]}}
+      onAskAI={onAskAI} onClose={jest.fn()}/>
+  );
+  expect(screen.getByRole('button', {name: 'Review with AI'})).toBeInTheDocument();
+  expect(screen.queryByRole('button', {name: 'Fix with AI'})).not.toBeInTheDocument();
+
+  rerender(
+    <ScenarioValidationDialog open loading={false}
+      result={{valid: false, state: 'needs_input', error_count: 1, warning_count: 0, issues: [error]}}
+      onAskAI={onAskAI} onClose={jest.fn()}/>
+  );
+  fireEvent.click(screen.getByRole('button', {name: 'Fix with AI'}));
+  expect(screen.queryByRole('button', {name: 'Review with AI'})).not.toBeInTheDocument();
+  expect(onAskAI).toHaveBeenCalledTimes(1);
+
+  rerender(
+    <ScenarioValidationDialog open loading={false}
+      result={{valid: false, state: 'infeasible', error_count: 0, warning_count: 0, issues: []}}
+      onAskAI={onAskAI} onClose={jest.fn()}/>
+  );
+  expect(screen.getByRole('button', {name: 'Fix with AI'})).toBeInTheDocument();
+});

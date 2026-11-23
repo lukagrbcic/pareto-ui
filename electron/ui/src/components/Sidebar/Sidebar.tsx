@@ -63,6 +63,24 @@ export default function Sidebar(props: SidebarProps) {
     const issueTables = (validation?.issues || []).filter(issue => issue.severity === 'error' && issue.table).map(issue => issue.table as string);
     return new Set<string>([...missingTables, ...tablesWithIssues, ...issueTables]);
   }, [validation]);
+  const aiChangedTables = useMemo(
+    () => props.aiDiff?.changedTables || {},
+    [props.aiDiff?.changedTables],
+  );
+  const dynamicAICount = useMemo(
+    () => Subcategories.Dynamic.filter(name => Boolean(aiChangedTables[name])).length,
+    [aiChangedTables],
+  );
+  const staticAICount = useMemo(
+    () => Subcategories.Static.filter(name => Boolean(aiChangedTables[name])).length,
+    [aiChangedTables],
+  );
+
+  useEffect(() => {
+    if (!category) return;
+    if (Subcategories.Dynamic.includes(String(category))) setOpenDynamic(true);
+    if (Subcategories.Static.includes(String(category))) setOpenStatic(true);
+  }, [category]);
 
   useEffect(() => {
     const tempOverrideList: string[] = []
@@ -163,6 +181,33 @@ export default function Sidebar(props: SidebarProps) {
       marginBottom: 1,
       fontWeight: "bold"
     },
+    aiStaged: {
+      backgroundColor: "rgba(1, 103, 143, 0.10)",
+      borderLeft: "3px solid #01678f",
+      color: "#015272",
+      cursor: "pointer",
+      padding: 10,
+      marginLeft: "10px",
+      marginRight: "10px",
+      borderRadius: "5px",
+      textAlign: "left",
+      marginTop: 1,
+      marginBottom: 1,
+    },
+    aiStagedSelected: {
+      backgroundColor: "rgba(1, 103, 143, 0.20)",
+      borderLeft: "3px solid #01678f",
+      color: "#015272",
+      cursor: "pointer",
+      padding: 10,
+      marginLeft: "10px",
+      marginRight: "10px",
+      borderRadius: "5px",
+      textAlign: "left",
+      marginTop: 1,
+      marginBottom: 1,
+      fontWeight: "bold",
+    },
   }
 
   const handleSaveModal = async () => {
@@ -176,7 +221,11 @@ export default function Sidebar(props: SidebarProps) {
     handleCloseSaveModal()
     setInputDataEdited?.(false)
     handleSetCategory(String(key || ''))
-    syncScenarioData?.()
+    if (props.onDiscardManualEdits) {
+      props.onDiscardManualEdits()
+    } else {
+      syncScenarioData?.()
+    }
   }
 
   const handleClick = (k: string) => {
@@ -191,8 +240,10 @@ export default function Sidebar(props: SidebarProps) {
 
   const getStyle = (k: string) => {
     try {
+      if (String(category) === k && aiChangedTables[k]) return styles.aiStagedSelected
       if (String(category) === k && validationIssueTables.has(k)) return styles.validationIssueSelected
       if (String(category) === k) return styles.selected
+      if (aiChangedTables[k]) return styles.aiStaged
       if (validationIssueTables.has(k)) return styles.validationIssue
       if (overrideList.includes(k)) return styles.override
       return styles.unselected
@@ -235,8 +286,8 @@ export default function Sidebar(props: SidebarProps) {
         <div>
           <div style={getStyle("Dynamic")}  onClick={() => setOpenDynamic(!openDynamic)}> 
             <p style={styles.topLevelCategory}>
-              <span style={{display:"flex", justifyContent: "space-between"}}>
-                Dynamic Inputs
+              <span style={{display:"flex", justifyContent: "space-between", alignItems: "center"}}>
+                <span>Dynamic Inputs{dynamicAICount > 0 ? ` (${dynamicAICount} AI)` : ""}</span>
                 <IconButton disableRipple size="small" sx={{marginTop: -3, marginBottom: -3}}>{openDynamic ? <ExpandLess /> : <ExpandMore />}</IconButton>
               </span>
             </p>
@@ -246,8 +297,8 @@ export default function Sidebar(props: SidebarProps) {
           {renderDynamicCategories()}
           <div style={getStyle("Static")}  onClick={() => setOpenStatic(!openStatic)}> 
               <p style={styles.topLevelCategory}>
-              <span style={{display:"flex", justifyContent: "space-between"}}>
-                Static Inputs
+              <span style={{display:"flex", justifyContent: "space-between", alignItems: "center"}}>
+                <span>Static Inputs{staticAICount > 0 ? ` (${staticAICount} AI)` : ""}</span>
                 <IconButton disableRipple size="small" sx={{marginTop: -3, marginBottom: -3}}>{openStatic ? <ExpandLess /> : <ExpandMore />}</IconButton>
               </span>
               </p>
@@ -273,6 +324,44 @@ export default function Sidebar(props: SidebarProps) {
     }
   }
 
+  const renderCategoryItemLabel = (value: string) => {
+    const label = CategoryNames[value]
+      ? CategoryNames[value]
+      : value
+          .replace('_dict', '')
+          .replace('v_F_', '')
+          .replace('v_C_', 'Cost ')
+          .replace('v_R_', 'Credit ')
+          .replace('v_L_', 'Water Level ')
+          .replace('v_S_', 'Slack ')
+          .replace('v_D_', 'Disposal ')
+          .replace('v_X_', 'Storage ')
+          .replace('v_T_', 'Treatment ')
+          .replace('vb_y_Flow', 'Directional Flow')
+          .replace('vb_y_', 'New ');
+    const stagedCount = aiChangedTables[value]?.changedCellCount;
+    return (
+      <span style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6 }}>
+        <span>{label}</span>
+        {stagedCount ? (
+          <span
+            style={{
+              fontSize: '0.68rem',
+              fontWeight: 700,
+              backgroundColor: '#01678f',
+              color: '#ffffff',
+              borderRadius: '999px',
+              padding: '1px 6px',
+              flexShrink: 0,
+            }}
+          >
+            AI · {stagedCount}
+          </span>
+        ) : null}
+      </span>
+    );
+  };
+
   const renderDynamicCategories = () => {
     return (
       <Collapse in={openDynamic} timeout="auto" unmountOnExit>
@@ -281,19 +370,7 @@ export default function Sidebar(props: SidebarProps) {
           <div style={getStyle(value)} onClick={() => handleClick(value)} key={`${value}${index}`}> 
           <Tooltip title={ParetoDictionary[value] ? ParetoDictionary[value] : CategoryNames[value] ? CategoryNames[value] : value} placement="right-start">
             <p style={styles.subcategory}>
-              {CategoryNames[value] ? CategoryNames[value] : 
-                    value.replace('_dict','')
-                    .replace('v_F_','')
-                    .replace('v_C_','Cost ')
-                    .replace('v_R_','Credit ')
-                    .replace('v_L_','Water Level ')
-                    .replace('v_S_','Slack ')
-                    .replace('v_D_','Disposal ')
-                    .replace('v_X_','Storage ')
-                    .replace('v_T_','Treatment ')
-                    .replace('vb_y_Flow','Directional Flow')
-                    .replace('vb_y_','New ')
-              }
+              {renderCategoryItemLabel(value)}
               </p>
               </Tooltip>
           </div>
@@ -311,19 +388,7 @@ export default function Sidebar(props: SidebarProps) {
           <div style={getStyle(value)} onClick={() => handleClick(value)} key={`${value}${index}`}> 
           <Tooltip title={ParetoDictionary[value] ? ParetoDictionary[value] : CategoryNames[value] ? CategoryNames[value] : value} placement="right-start">
             <p style={styles.subcategory}>
-              {CategoryNames[value] ? CategoryNames[value] : 
-                    value.replace('_dict','')
-                    .replace('v_F_','')
-                    .replace('v_C_','Cost ')
-                    .replace('v_R_','Credit ')
-                    .replace('v_L_','Water Level ')
-                    .replace('v_S_','Slack ')
-                    .replace('v_D_','Disposal ')
-                    .replace('v_X_','Storage ')
-                    .replace('v_T_','Treatment ')
-                    .replace('vb_y_Flow','Directional Flow')
-                    .replace('vb_y_','New ')
-              }
+              {renderCategoryItemLabel(value)}
               </p>
               </Tooltip>
           </div>

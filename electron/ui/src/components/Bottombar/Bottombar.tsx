@@ -13,9 +13,8 @@ import PopupModal from '../../components/PopupModal/PopupModal';
 import AddIcon from '@mui/icons-material/Add';
 import { advanceToOptimizationSetup, generateExcelFromMap, validateScenario, checkScenarioFeasibility } from '../../services/app.service';
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome';
-import AIPromptDialog from '../AIPromptDialog/AIPromptDialog';
 import { useAIPrompt } from '../../context/AIPromptContext';
-import ScenarioValidationDialog from '../ScenarioValidationDialog/ScenarioValidationDialog';
+import ScenarioValidationDialog, { hasScenarioValidationErrors } from '../ScenarioValidationDialog/ScenarioValidationDialog';
 import {ApiClientError} from '../../services/apiClient';
 import {useWorkbookDownload} from '../../hooks/useWorkbookDownload';
 import ErrorBar from '../ErrorBar/ErrorBar';
@@ -23,7 +22,7 @@ import type {ScenarioValidation} from '../../types';
 
 
 export default function Bottombar(props) {
-    const { isAvailable: isAIAvailable } = useAIPrompt();
+    const { isAvailable: isAIAvailable, isPanelOpen, openPanel, togglePanel, sendChatMessage } = useAIPrompt();
     const {
       scenario,
       backgroundTasks,
@@ -49,8 +48,6 @@ export default function Bottombar(props) {
     const [ newScenarioName, setNewScenarioName ] = useState('')
     const [ showModalError, setShowModalError ] = useState(false)
     const [ modalError, setModalError ] = useState('')
-    const [ openAIPrompt, setOpenAIPrompt ] = useState(false)
-    const [ aiValidationFindings, setAiValidationFindings ] = useState<ScenarioValidation | null>(null)
     const [ key, setKey ] =  useState(null)
     const [ hasOverride, setHasOverride ] = useState(false)
     const [ openValidationDialog, setOpenValidationDialog ] = useState(false)
@@ -62,7 +59,6 @@ export default function Bottombar(props) {
     useEffect(() => {
       setValidationResult(null); setValidationLoading(false); setValidationAdvancing(false); setValidationError(null);
       setOpenValidationDialog(false);
-      setAiValidationFindings(null);
       return () => { validationVersion.current += 1; };
       // Clearing on scenario/revision changes keeps stale AI findings from a
       // previous revision out of the next fill request.
@@ -70,27 +66,34 @@ export default function Bottombar(props) {
     const handleOpenSaveModal = () => setOpenSaveModal(true);
     const handleCloseSaveModal = () => setOpenSaveModal(false);
     const handleCloseRerunModal = () => setOpenRerunModal(false);
-    const handleOpenAIPrompt = () => {
-      // Ground standalone fills too: attach the latest validation findings when
-      // the dialog was not opened through "Fix with AI".
-      if (!aiValidationFindings && validationResult) {
-        setAiValidationFindings(validationResult);
-      }
-      setOpenAIPrompt(true);
+    const handleToggleAIPanel = () => {
+      togglePanel?.({
+        scenarioId: id,
+      });
     };
-    const handleCloseAIPrompt = () => { setOpenAIPrompt(false); setAiValidationFindings(null); };
-    // "Fix with AI" in the validation dialog: hand the whole validation result
-    // to the AI dialog so the fill prompt targets the actual issues.
+    // "Fix/Review with AI" in the validation dialog: close the validation modal,
+    // open the docked AI side window, and immediately run the AI request.
     const handleFixValidationWithAI = (result: ScenarioValidation) => {
       setOpenValidationDialog(false);
-      setAiValidationFindings(result);
-      setOpenAIPrompt(true);
-    };
-    // Close the review-apply loop: after AI updates are saved, validation
-    // re-runs automatically so the user immediately sees what remains.
-    const handleAIUpdatesApplied = () => {
-      handleCloseAIPrompt();
-      handleValidateScenario();
+      openPanel?.({
+        scenarioId: id,
+        revalidateOnApply: true,
+      });
+      if (id === undefined || id === null) return;
+      const hasErrors = hasScenarioValidationErrors(result);
+      const hasWarnings =
+        (result.warning_count ?? 0) > 0 ||
+        (result.issues || []).some(issue => issue.severity === 'warning');
+      const autoPrompt = hasErrors
+        ? 'Fix the validation issues in this scenario using reasonable defaults and explain what you changed.'
+        : hasWarnings
+          ? 'Review my scenario inputs and validation assumptions, check for potential bottlenecks or unusual values, and let me know if anything should be adjusted.'
+          : 'Review my scenario inputs, check capacities and forecasts for any potential bottlenecks or unusual assumptions, and summarize your findings.';
+      void sendChatMessage?.(id, autoPrompt, scenario?.data_input, {
+        validationFindings: result,
+        revalidateOnApply: true,
+        baseRevision: scenario?.input_revision,
+      });
     };
     const handleCloseValidationDialog = () => setOpenValidationDialog(false);
 
@@ -140,7 +143,11 @@ export default function Bottombar(props) {
         handleCloseSaveModal()
         setInputDataEdited(false)
         handleSelection(key)
-        syncScenarioData()
+        if (props.onDiscardManualEdits) {
+          props.onDiscardManualEdits()
+        } else {
+          syncScenarioData()
+        }
       }
     
       const handleClick = (key) => {
@@ -214,9 +221,13 @@ export default function Bottombar(props) {
         setValidationAdvancing(true)
         const version = ++validationVersion.current;
         advanceToOptimizationSetup(port, id)
-          .then(() => {
+          .then((response) => {
             if (validationVersion.current !== version) return;
-            syncScenarioData()
+            if (response?.data && props.acceptSavedScenario) {
+              props.acceptSavedScenario(response.data);
+            } else {
+              syncScenarioData();
+            }
             handleCloseValidationDialog()
             handleSelection(1)
           })
@@ -236,16 +247,35 @@ export default function Bottombar(props) {
         setOpenValidationDialog(false)
       }
 
+      useEffect(() => {
+        if (props.revalidateSignal > 0) {
+          handleValidateScenario();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [props.revalidateSignal]);
+
       const validateScenarioButton = <Button
                                 sx={styles.unfilled}
-                                onClick={() => handleValidateScenario()}
-                                disabled={props.saving || inputDataEdited || backgroundTasks?.includes(id)}
+                                onClick={() => props.onRequestValidation ? props.onRequestValidation() : handleValidateScenario()}
+                                disabled={props.saving || inputDataEdited || props.hasStagedAI || backgroundTasks?.includes(id)}
                                 variant="outlined"
                                 size="large"
                                 startIcon={<FactCheckIcon /> }
                               >
                                 Validate Scenario
                               </Button>
+
+      const aiAssistantButton = isAIAvailable ? (
+        <Button
+          sx={isPanelOpen ? styles.filled : styles.unfilled}
+          onClick={handleToggleAIPanel}
+          variant={isPanelOpen ? "contained" : "outlined"}
+          size="large"
+          startIcon={<AutoAwesomeIcon />}
+        >
+          {status === "Incomplete" ? "AI Fill Inputs" : "AI Assistant"}
+        </Button>
+      ) : null;
 
   return ( 
     <Box sx={{ width: 500 }}>
@@ -266,9 +296,11 @@ export default function Bottombar(props) {
                             status != "Incomplete" ?
                             <Box sx={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                               {validateScenarioButton}
+                              {aiAssistantButton}
                               <Button
                                 sx={styles.filled}
                                 onClick={() => handleClick(1)}
+                                disabled={Boolean(props.hasStagedAI)}
                                 variant="contained"
                                 size="large"
                                 endIcon={<ArrowForwardIcon /> }
@@ -278,15 +310,7 @@ export default function Bottombar(props) {
                             </Box> : 
                             <Box sx={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                               {validateScenarioButton}
-                              {isAIAvailable && <Button
-                                sx={styles.unfilled}
-                                onClick={handleOpenAIPrompt}
-                                variant="outlined"
-                                size="large"
-                                startIcon={<AutoAwesomeIcon />}
-                              >
-                                AI Fill Inputs
-                              </Button>}
+                              {aiAssistantButton}
                               <Button
                                 sx={styles.filled}
                                 onClick={handleClickGenerateSpreadsheet}
@@ -305,7 +329,7 @@ export default function Bottombar(props) {
                             sx={styles.filled}
                             variant="contained"
                             size="large"
-                            disabled={disableOptimize || props.saving || inputDataEdited}
+                            disabled={disableOptimize || props.saving || inputDataEdited || props.hasStagedAI}
                             endIcon={<ArrowForwardIcon /> }
                           >
                             Optimize
@@ -317,7 +341,7 @@ export default function Bottombar(props) {
                             sx={styles.filled}
                             variant="contained"
                             size="large"
-                            disabled={disableOptimize || props.saving || inputDataEdited}
+                            disabled={disableOptimize || props.saving || inputDataEdited || props.hasStagedAI}
                             endIcon={<ArrowForwardIcon />}
                           >
                             Re-run Optimization
@@ -368,16 +392,6 @@ export default function Bottombar(props) {
         showError={showModalError}
         errorText={modalError}
       />
-      {isAIAvailable && <AIPromptDialog
-        open={openAIPrompt}
-        onClose={handleCloseAIPrompt}
-        scenarioId={id}
-        scenarioName={name}
-        // Findings captured from "Fix with AI" or the last validation run;
-        // onApplied re-validates after the user saves AI updates.
-        validationFindings={aiValidationFindings}
-        onApplied={handleAIUpdatesApplied}
-      />}
       <ScenarioValidationDialog
         open={openValidationDialog}
         loading={validationLoading}
@@ -388,8 +402,6 @@ export default function Bottombar(props) {
         onSelectTable={handleSelectValidationTable}
         onCheckFeasibility={() => handleValidateScenario(true)}
         onSelectIssue={issue => { setOpenValidationDialog(false); props.focusInputIssue?.(issue); }}
-        // Only offer "Fix with AI" when AI is configured, so non-AI setups see
-        // exactly main's validation dialog.
         onAskAI={isAIAvailable ? handleFixValidationWithAI : undefined}
         onClose={handleCloseValidationDialog}
       />
