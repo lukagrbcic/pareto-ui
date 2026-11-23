@@ -149,3 +149,4 @@ idaes_extensions/
 extensions/
 *_testing*
 /pareto_docs*
+*ai_ab_results*
